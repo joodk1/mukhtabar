@@ -89,3 +89,11 @@ def test_rechunk_uses_stored_pages(conn, fake_pdf, monkeypatch):
 ])
 def test_guess_language(text, expected):
     assert guess_language(text) == expected
+
+
+def test_llm_call_rejections_are_stored(conn):
+    sid = db.create_study_set(conn, "R", "ar")
+    db.log_llm_call(conn, sid, {"purpose": "p", "model": "m", "attempts": 2, "ok": True,
+                                "rejections": ["question 1: \"evidence\" must be copied word for word"]})
+    stored = conn.execute("SELECT rejections FROM llm_calls").fetchone()[0]
+    assert json.loads(stored) == ["question 1: \"evidence\" must be copied word for word"]

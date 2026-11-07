@@ -67,8 +67,8 @@ mukhtabar/
       pipeline.py        # extract -> clean -> chunk -> SQLite; language guess; rechunk
       __main__.py        # CLI: python -m mukhtabar.ingest add|rechunk|removed
     topics.py            # topic map from chunks
-    questions.py         # generate MCQ + short-answer, with source refs
-    grading.py           # MCQ exact match, short-answer graded by model
+    questions.py         # generate grounded MCQs, with source refs and evidence
+    grading.py           # MCQ exact match
     mastery.py           # per-topic scores + spaced-repetition schedule
     selection.py         # fixed and adaptive "what to ask next"
     db.py                # SQLite schema + queries
@@ -99,7 +99,7 @@ Each study set lives in its own folder/record: its material, chunks, topics, que
 - Track attempt count too. A score from 2 answers is less trustworthy than one from 20.
 - Spaced repetition: simple Leitner / SM-2-lite. Correct answers push the next review further out, wrong answers pull it back.
 - Scheduling is **per topic, by design**, not per question. The goal is retained understanding of a topic, and questions are drawn fresh (or from cache) each review, so a per-question schedule isn't needed.
-- Short-answer questions give partial credit (0–1) instead of just right/wrong.
+- Questions are multiple choice, graded by exact match (right or wrong).
 
 ## Diagnostic modes (one engine)
 
@@ -122,7 +122,7 @@ Both modes call `selection.next_question(state)`. Only the strategy differs.
 1. **Ingest + SQLite.** Extract, remove running headers/footers, chunk, store; driven by a command-line tool until the UI exists. Language guessed (Arabic with English terms counts as Arabic), with an override.
    - 1b. Synthetic Arabic test PDFs (see Testing), as a small separate step.
 2. **Topic map.** Generate topics from chunks. Let the user rename, merge, or delete topics, since model outlines can be rough.
-3. **Question generation.** MCQ and short-answer, grounded, validated, cached.
+3. **Question generation.** Multiple choice only (6 per topic), grounded in one study chunk with a quoted evidence passage, validated, never copied from the user's own practice questions, cached.
 4. **Quiz engine + mastery.** Both diagnostic modes, scoring, mastery updates.
 5. **Streamlit UI.** Upload, choose study set, take a quiz, see a weak-topics dashboard. RTL support when the language is Arabic.
 6. **Practice loop.** Targeted drills on weak topics, explanations from the source, spaced-repetition scheduling.
@@ -142,5 +142,7 @@ Both modes call `selection.next_question(state)`. Only the strategy differs.
 - Whether weak-topic explanations should be a chat or a one-shot card
 
 ## Ideas for later (not planned)
+
+- **Short-answer questions:** open questions graded by the model with partial credit (0–1). Dropped from milestone 3 in favour of MCQ only; the `questions` table keeps its `key_points` column so this can return without a migration.
 
 - **Question-bank import:** if a user's own material is already a question bank (questions, options, answer, explanation), import those as ready-made questions instead of generating new ones. Users' own files only; never bundle any question bank with the repo.

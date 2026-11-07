@@ -157,6 +157,7 @@ def complete_json(
     usage = Usage()
     msgs = list(messages)
     last_reply, error, ok = None, None, False
+    rejections: list[str] = []   # why each invalid reply was rejected
     started = time.perf_counter()
     try:
         for attempt in range(1, max_attempts + 1):
@@ -173,6 +174,7 @@ def complete_json(
                 result = validate(parse_json(last_reply))
             except Invalid as e:
                 error = str(e)
+                rejections.append(error)
                 msgs += [{"role": "assistant", "content": last_reply or ""},
                          {"role": "user", "content": RETRY_PROMPT.format(error=error)}]
                 continue
@@ -192,4 +194,4 @@ def complete_json(
             log({"purpose": purpose, "model": model, "input_tokens": usage.input_tokens,
                  "output_tokens": usage.output_tokens, "cost_usd": usage.cost_usd,
                  "attempts": usage.attempts, "ok": ok, "error": None if ok else error,
-                 "seconds": round(usage.seconds, 2)})
+                 "rejections": rejections, "seconds": round(usage.seconds, 2)})

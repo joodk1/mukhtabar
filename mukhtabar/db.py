@@ -100,6 +100,34 @@ MIGRATIONS = [
     """
     ALTER TABLE chunks ADD COLUMN user_choice TEXT;  -- NULL, 'include' or 'exclude'
     """,
+    # 5: generated questions (milestone 3) and answers to them (milestone 4)
+    """
+    CREATE TABLE questions (
+        id           INTEGER PRIMARY KEY,
+        topic_id     INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+        chunk_id     INTEGER REFERENCES chunks(id) ON DELETE SET NULL,  -- the source; kept if chunks change
+        type         TEXT NOT NULL,             -- 'mcq' or 'short'
+        prompt       TEXT NOT NULL,
+        options      TEXT,                      -- JSON list of 4, for mcq
+        answer       TEXT NOT NULL,             -- mcq: index of the correct option; short: model answer
+        key_points   TEXT,                      -- JSON list, for short answers (partial credit)
+        explanation  TEXT NOT NULL,
+        evidence     TEXT NOT NULL,             -- quote from the source chunk that supports the answer
+        model        TEXT NOT NULL,
+        created_at   TEXT NOT NULL
+    );
+    CREATE TABLE attempts (
+        id          INTEGER PRIMARY KEY,
+        question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+        response    TEXT,
+        score       REAL NOT NULL,              -- 0-1; short answers can earn partial credit
+        answered_at TEXT NOT NULL
+    );
+    """,
+    # 6: why invalid replies were rejected, even when a later attempt succeeded
+    """
+    ALTER TABLE llm_calls ADD COLUMN rejections TEXT;  -- JSON list of validation errors
+    """,
 ]
 
 
@@ -319,11 +347,12 @@ def empty_topics(conn: sqlite3.Connection, study_set_id: int) -> list[sqlite3.Ro
 def log_llm_call(conn: sqlite3.Connection, study_set_id: int | None, record: dict) -> None:
     conn.execute(
         """INSERT INTO llm_calls (study_set_id, purpose, model, input_tokens, output_tokens, cost_usd,
-                                  attempts, ok, error, seconds, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                  attempts, ok, error, seconds, created_at, rejections)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (study_set_id, record["purpose"], record["model"], record.get("input_tokens"),
          record.get("output_tokens"), record.get("cost_usd"), record["attempts"], int(record["ok"]),
-         record.get("error"), record.get("seconds"), _now()),
+         record.get("error"), record.get("seconds"), _now(),
+         json.dumps(record.get("rejections") or [], ensure_ascii=False)),
     )
     conn.commit()
 
@@ -347,3 +376,30 @@ def cache_put(conn: sqlite3.Connection, key: str, study_set_id: int, purpose: st
 
 def cache_clear(conn: sqlite3.Connection, study_set_id: int) -> None:
     conn.execute("DELETE FROM llm_cache WHERE study_set_id = ?", (study_set_id,))
+
+
+# --- Questions (milestone 3) ---
+
+def topic_sources(conn: sqlite3.Connection, topic_id: int) -> list[sqlite3.Row]:
+    """A topic's chunks, primary links first, each with its link kind."""
+    return conn.execute(
+        """SELECT c.*, d.filename, tc.is_primary FROM topic_chunks tc JOIN chunks c ON c.id = tc.chunk_id
+           JOIN documents d ON d.id = c.document_id WHERE tc.topic_id = ?
+           ORDER BY tc.is_primary DESC, d.id, c.position""", (topic_id,)
+    ).fetchall()
+
+
+def add_question(conn: sqlite3.Connection, topic_id: int, q: dict, model: str) -> int:
+    cur = conn.execute(
+        """INSERT INTO questions (topic_id, chunk_id, type, prompt, options, answer, key_points, explanation,
+                                  evidence, model, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (topic_id, q["chunk_id"], q["type"], q["prompt"],
+         json.dumps(q.get("options"), ensure_ascii=False) if q.get("options") else None,
+         str(q["answer"]), json.dumps(q.get("key_points"), ensure_ascii=False) if q.get("key_points") else None,
+         q["explanation"], q["evidence"], model, _now()),
+    )
+    return cur.lastrowid
+
+
+def questions(conn: sqlite3.Connection, topic_id: int) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM questions WHERE topic_id = ? ORDER BY id", (topic_id,)).fetchall()

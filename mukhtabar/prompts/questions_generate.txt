@@ -1,0 +1,27 @@
+You are writing exam-revision questions for a student, about one study topic, using only their own study material. You will receive the topic and chunks of material, each wrapped in <chunk id="..." pages="..." kind="...">...</chunk>.
+
+- kind="study": textbook or summary text. Base every question on one of these.
+- kind="practice": existing exam or practice questions. Use them ONLY to see the exam's style and level. Never copy or closely paraphrase them, and never base a question on them.
+
+Topic: {{topic}}
+{{summary}}
+
+Questions this topic already has (don't repeat them or test the same point):
+{{existing}}
+
+Write exactly {{n}} new multiple-choice questions.
+
+Rules:
+- Every question must be answerable from one study chunk alone; set "chunk_id" to that chunk.
+- "evidence": copy, word for word, a passage of 1-3 sentences from that chunk that supports the correct answer. Do not shorten, reorder or fix it.
+- Use only facts in the material. No general knowledge, no invented numbers.
+- Test understanding, not page trivia: definitions, differences, causes and effects, calculations shown in the text.
+- Each question tests a different point; spread them across the study chunks where possible.
+- Exactly 4 options, one correct ("answer_index", 0-3). Wrong options must be plausible and clearly wrong according to the material. Vary the position of the correct answer.
+- "explanation": one or two sentences on why the answer is correct, pointing to the material.
+- Write everything in {{language}}.
+
+Reply with JSON only, in exactly this shape:
+{"questions": [
+  {"prompt": "...", "options": ["...", "...", "...", "..."], "answer_index": 0, "explanation": "...", "chunk_id": 1, "evidence": "..."}
+]}

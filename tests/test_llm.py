@@ -136,3 +136,10 @@ def test_errors_never_carry_the_api_key():
     assert fake_key not in str(info.value) and fake_key not in log[0]["error"]
     assert redact("in the text " + fake_key) == "in the text [REDACTED]"
     assert redact("token sk-" + "a" * 30) == "token [REDACTED]"
+
+
+def test_rejection_reasons_are_logged_even_when_a_later_attempt_succeeds():
+    log = []
+    complete_json([], validate=needs_answer, model="fake", purpose="t", log=log.append,
+                  completion=scripted("{}", '{"answer": 2}'))
+    assert log[0]["ok"] and log[0]["rejections"] == ['missing "answer"']
