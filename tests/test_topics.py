@@ -38,9 +38,10 @@ def reply(obj):
                            usage=SimpleNamespace(prompt_tokens=100, completion_tokens=20))
 
 
-def fake_model(drop_first_map_id=False):
+def fake_model(drop_first_map_id=False, always_drop_first=False):
     """Replies like a well-behaved model, reading ids from the prompt. Optionally
-    leaves a chunk out of its first map reply, to exercise the retry."""
+    leaves a chunk out of its first map reply (or of every first attempt), to
+    exercise retries."""
     state = {"map": 0}
 
     def completion(messages, **kwargs):
@@ -50,7 +51,7 @@ def fake_model(drop_first_map_id=False):
             chunks = re.findall(r'<chunk id="(\d+)"[^>]*>\n(.*?)\n</chunk>', user, re.S)
             non_study = [int(i) for i, t in chunks if "فهرس المحتويات" in t]
             ids = [int(i) for i, _ in chunks if int(i) not in non_study]
-            if drop_first_map_id and state["map"] == 1 and len(messages) == 2:
+            if (drop_first_map_id and state["map"] == 1 or always_drop_first) and len(messages) == 2:
                 ids = ids[:-1]
             groups = [ids[i:i + 2] for i in range(0, len(ids), 2)]
             return reply({"topics": [{"title": f"موضوع رقم {g[0]}", "summary": "ملخص قصير للموضوع", "chunk_ids": g}
@@ -68,6 +69,11 @@ def fake_model(drop_first_map_id=False):
             groups = [local[i::n] for i in range(n)]
             return reply({"topics": [{"title": f"الموضوع النهائي {state['reduce']}-{k}", "summary": "ملخص",
                                       "local_topic_ids": g} for k, g in enumerate(groups, 1)]})
+        if "choose the study topic it tests or explains" in system:
+            ids = [int(i) for i in re.findall(r'<chunk id="(\d+)"', user)]
+            n_topics = len(re.findall(r'^\{"id": \d+', system, re.M))
+            return reply({"placements": [{"chunk_id": i, "topic_id": 1, "also": [2] if n_topics > 1 else []}
+                                         for i in ids], "non_study": []})
         if "Place each new local topic" in system:
             existing = [int(i) for i in re.findall(r'"id": (\d+)', user.split("New local topics")[0])]
             local = re.findall(r'"id": "(b\d+-t\d+)"', user)
@@ -214,7 +220,6 @@ def test_validation_rejects_bad_replies(conn):
     for bad, message in [
         ({"topics": [{**good, "chunk_ids": ids[:-1]}]}, "missing"),
         ({"topics": [{**good, "chunk_ids": ids + [99999]}]}, "not one of this batch"),
-        ({"topics": [good, {**good, "title": "آخر"}]}, "more than once"),
         ({"topics": [{**good, "title": "Savings basics"}]}, "Arabic"),
     ]:
         with pytest.raises(Invalid, match=message):
@@ -378,3 +383,122 @@ def test_include_and_exclude_are_kept_across_rebuilds(conn):
         topics.build(conn, "Set A", "fake", topics.select_chunks(conn, sid), force=True, completion=fake_model())
     assert some not in {c["id"] for c in topics.select_chunks(conn, sid)}
     assert db.get_chunk(conn, some)["user_choice"] == "exclude"
+
+
+CH_PRACTICE = "أسئلة تدريبية"
+MCQ = "ما الصحيح من العبارات الآتية؟\nأ. العبارة الأولى\nب. العبارة الثانية\nج. العبارة الثالثة"
+GLOSSARY = "العائد الجاري Current Yield\nتعريف قصير للمصطلح.\nالقيمة الاسمية Nominal Value\nتعريف آخر."
+
+
+@pytest.fixture
+def practice_conn(tmp_path):
+    """A book with one subject chapter (including a glossary page) and a practice-question chapter."""
+    conn = db.connect(tmp_path / "p.db")
+    pages = [(p, f"{CH1}\n{BODY} صفحة {p}.") for p in range(1, 7)]
+    pages[5] = (6, f"{CH1}\n{GLOSSARY}")
+    pages += [(p, f"{CH_PRACTICE}\n{MCQ}") for p in range(7, 12)]
+    with conn:
+        sid = db.create_study_set(conn, "Set P", "ar")
+        doc = db.add_document(conn, sid, "book.pdf", "b", len(pages))
+        db.add_pages(conn, doc, [(p, t, [], []) for p, t in pages])
+        db.replace_chunks(conn, sid, doc, [SimpleNamespace(text=t, page=p, page_end=p, position=i)
+                                           for i, (p, t) in enumerate(pages)])
+    return conn
+
+
+def test_practice_chapters_and_glossary_chunks_are_cross_cutting(practice_conn):
+    sid = db.get_study_set(practice_conn, "Set P")["id"]
+    chunks = topics.select_chunks(practice_conn, sid)
+    hints = topics.set_hints(practice_conn, sid)
+    assert topics.practice_chapters(chunks, hints) == {CH_PRACTICE}
+    # Pages 7-11 are the practice chapter, plus its two opener pages (5-6); page 6 is also a glossary page.
+    assert sorted(c["page"] for c in topics.cross_cutting(chunks, hints)) == [5, 6, 7, 8, 9, 10, 11]
+
+
+def test_practice_and_glossary_chunks_are_placed_into_subject_topics(practice_conn):
+    sid = db.get_study_set(practice_conn, "Set P")["id"]
+    chunks = topics.select_chunks(practice_conn, sid)
+    hints = topics.set_hints(practice_conn, sid)
+    cross = {c["id"] for c in topics.cross_cutting(chunks, hints)}
+    topics.build(practice_conn, "Set P", "fake", chunks, completion=fake_model())
+    assert all(t["chapter"] != CH_PRACTICE for t in db.topics(practice_conn, sid))  # no practice-only topics
+    primary = dict(practice_conn.execute("SELECT chunk_id, topic_id FROM topic_chunks WHERE is_primary = 1"))
+    assert cross <= set(primary)
+    assert len(primary) == len(chunks)
+    assert "topics.place" in purposes(practice_conn)
+
+
+def test_secondary_links_never_repeat_the_primary(practice_conn):
+    rows = practice_conn.execute("SELECT chunk_id, topic_id, is_primary FROM topic_chunks").fetchall()
+    assert rows == []  # nothing built yet in this fixture
+    local = [topics.LocalTopic("b1-t1", "موضوع", "", [1], "b", "1-1")]
+    batch = [{"id": 5, "text": MCQ, "user_choice": None}]
+    with pytest.raises(Invalid, match="repeats"):
+        topics.validate_place({"placements": [{"chunk_id": 5, "topic_id": 2, "also": [2]}]}, batch, n_topics=3)
+    with pytest.raises(Invalid, match="study material"):
+        topics.validate_place({"placements": [], "non_study": [{"chunk_id": 5}]}, batch, n_topics=3)
+    placed, _ = topics.validate_place({"placements": [{"chunk_id": 5, "topic_id": 1, "also": [3]}]}, batch, n_topics=3)
+    assert (placed[0].topic, placed[0].also) == (0, [2]) and local
+
+
+def test_build_stops_when_invalid_replies_pile_up(conn):
+    sid = set_id(conn)
+    chunks = topics.select_chunks(conn, sid)
+    with pytest.raises(topics.RetryBudgetExceeded, match="invalid replies"):
+        topics.build(conn, "Set A", "fake", chunks, completion=fake_model(always_drop_first=True), batch_chars=400,
+                     retry_budget=3)
+    assert db.topics(conn, sid) == []
+    # Finished batches are kept, so after fixing the cause the build resumes.
+    assert conn.execute("SELECT COUNT(*) FROM llm_cache").fetchone()[0] > 0
+
+
+def test_estimate_includes_placement(practice_conn):
+    sid = db.get_study_set(practice_conn, "Set P")["id"]
+    chunks = topics.select_chunks(practice_conn, sid)
+    hints = topics.set_hints(practice_conn, sid)
+    cross = topics.cross_cutting(chunks, hints)
+    ids = {c["id"] for c in cross}
+    batches = topics.make_batches([c for c in chunks if c["id"] not in ids], hints)
+    e = topics.estimate("gemini/gemini-2.5-flash", batches, "ar", extra_calls=1, token_counter=len, place_chunks=cross)
+    assert e.calls == len(batches) + 1 + 1 and e.chunks == len(chunks)
+
+
+def test_chunk_listed_in_two_topics_becomes_a_secondary_link(conn):
+    batch = topics.make_batches(topics.select_chunks(conn, set_id(conn)), [], budget=10_000)[0]
+    a, b, c = (x["id"] for x in batch.chunks[1:4])
+    rest = [x["id"] for x in batch.chunks if x["id"] not in (a, b, c)]
+    reply = {"topics": [{"title": "الأول", "chunk_ids": [a, b]},
+                        {"title": "الثاني", "chunk_ids": [b, c] + rest}]}
+    result = topics.validate_map(reply, batch, "ar")
+    first, second = result.topics
+    assert (first.chunk_ids, first.also_chunk_ids) == ([a, b], [])
+    assert (second.chunk_ids[:1], second.also_chunk_ids) == ([c], [b])
+    assert result.duplicates == 1
+    # Still rejected: a chunk from outside the batch, and a missing chunk.
+    with pytest.raises(Invalid, match="not one of this batch"):
+        topics.validate_map({"topics": [{"title": "الأول", "chunk_ids": [a, 999999]}]}, batch, "ar")
+    with pytest.raises(Invalid, match="missing"):
+        topics.validate_map({"topics": [{"title": "الأول", "chunk_ids": [a, b]}]}, batch, "ar")
+
+
+def test_duplicate_listing_is_stored_as_one_primary_and_one_secondary(conn):
+    sid = set_id(conn)
+    good = fake_model()
+
+    def duplicating(messages, **kwargs):
+        r = good(messages, **kwargs)
+        if "Group the chunks" in messages[0]["content"]:
+            obj = json.loads(r.choices[0].message.content)
+            if len(obj["topics"]) > 1:   # also list the first topic's first chunk in the second topic
+                obj["topics"][1]["chunk_ids"].append(obj["topics"][0]["chunk_ids"][0])
+            r.choices[0].message.content = json.dumps(obj, ensure_ascii=False)
+        return r
+    topics.build(conn, "Set A", "fake", topics.select_chunks(conn, sid), completion=duplicating)
+    rows = conn.execute("SELECT chunk_id, SUM(is_primary), COUNT(*) FROM topic_chunks GROUP BY chunk_id").fetchall()
+    assert all(primary == 1 for _, primary, _ in rows)          # exactly one primary per chunk
+    assert any(links > 1 for _, _, links in rows)               # some chunk also has a secondary link
+    assert topics.select_chunks(conn, sid) and db.unassigned_chunks(conn, sid) == []
+
+
+def test_default_retry_budget_is_20(conn):
+    assert topics.RETRY_BUDGET == 20 and topics.Budget(conn, set_id(conn)).limit == 20

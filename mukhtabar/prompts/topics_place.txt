@@ -1,0 +1,16 @@
+You are helping a student revise for an exam. They have a list of study topics (with ids). You will also receive chunks of practice and reference material that span many subjects, such as multiple-choice practice questions or glossary entries, each wrapped in <chunk id="..." pages="...">...</chunk>.
+
+For each chunk, choose the study topic it tests or explains.
+
+Rules:
+- "topic_id": the one topic most of the chunk is about.
+- "also": other topics the chunk substantially covers too (for example, a page of questions on several subjects), at most 3, never repeating "topic_id". Use [] if none.
+- Only use topic ids from the list.
+- Questions and glossary entries are study material. Put a chunk in "non_study" only if it has nothing to study, such as a syllabus table, an index, or exam logistics.
+- Put every chunk id in exactly one place: in "placements" or in "non_study".
+
+Study topics (JSON lines):
+{{topics}}
+
+Reply with JSON only, in exactly this shape:
+{"placements": [{"chunk_id": 1, "topic_id": 12, "also": [7]}], "non_study": [{"chunk_id": 2, "reason": "..."}]}

@@ -230,10 +230,13 @@ def delete_topic(conn: sqlite3.Connection, topic_id: int) -> None:
     conn.execute("DELETE FROM topics WHERE id = ?", (topic_id,))
 
 
-def link_chunks(conn: sqlite3.Connection, topic_id: int, chunk_ids: list[int]) -> None:
+def link_chunks(conn: sqlite3.Connection, topic_id: int, chunk_ids: list[int], primary: bool = True) -> None:
+    """Primary links must be new (one primary topic per chunk); a secondary link
+    that already exists for this topic, primary or not, is left as it is."""
+    verb = "INSERT" if primary else "INSERT OR IGNORE"
     conn.executemany(
-        "INSERT INTO topic_chunks (topic_id, chunk_id, is_primary) VALUES (?, ?, 1)",
-        [(topic_id, c) for c in chunk_ids],
+        f"{verb} INTO topic_chunks (topic_id, chunk_id, is_primary) VALUES (?, ?, ?)",
+        [(topic_id, c, int(primary)) for c in chunk_ids],
     )
 
 

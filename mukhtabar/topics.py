@@ -249,12 +249,14 @@ class LocalTopic:
     document: str
     pages: str
     chapter: str | None = None
+    also_chunk_ids: list[int] = field(default_factory=list)   # secondary links
 
 
 @dataclass
 class MapResult:
     topics: list[LocalTopic]
     non_study: dict[int, str]
+    duplicates: int = 0   # chunks listed in a second topic, kept there as secondary links
 
 
 def validate_map(obj, batch: Batch, language: str) -> MapResult:
@@ -263,6 +265,7 @@ def validate_map(obj, batch: Batch, language: str) -> MapResult:
     expected = {c["id"]: c for c in batch.chunks}
     seen: dict[int, str] = {}
     topics, titles = [], set()
+    duplicates = 0
     if not 1 <= len(obj["topics"]) <= MAP_MAX_TOPICS:
         raise Invalid(f"return between 1 and {MAP_MAX_TOPICS} topics, not {len(obj['topics'])}")
     for i, t in enumerate(obj["topics"], start=1):
@@ -275,16 +278,24 @@ def validate_map(obj, batch: Batch, language: str) -> MapResult:
         ids = t.get("chunk_ids")
         if not isinstance(ids, list) or not ids:
             raise Invalid(f"topic {title!r} has no chunk_ids")
+        primary, also = [], []
         for cid in ids:
             if not isinstance(cid, int) or cid not in expected:
                 raise Invalid(f"chunk id {cid!r} is not one of this batch's chunks")
             if cid in seen:
-                raise Invalid(f"chunk {cid} appears more than once ({seen[cid]!r} and {title!r})")
+                # Listed in an earlier topic too: that one stays primary, this one
+                # becomes a secondary link. Repeats within one topic are ignored.
+                if seen[cid] != title and cid not in also:
+                    also.append(cid)
+                    duplicates += 1
+                continue
             seen[cid] = title
+            primary.append(cid)
         rows = [expected[c] for c in ids]
         topics.append(LocalTopic(f"b{batch.index}-t{i}", title, _check_summary(t.get("summary"), language),
-                                 list(ids), rows[0]["filename"],
-                                 f"{min(r['page'] for r in rows)}-{max(r['page_end'] for r in rows)}"))
+                                 primary, rows[0]["filename"],
+                                 f"{min(r['page'] for r in rows)}-{max(r['page_end'] for r in rows)}",
+                                 also_chunk_ids=also))
     non_study: dict[int, str] = {}
     for n in obj.get("non_study") or []:
         cid = n.get("chunk_id") if isinstance(n, dict) else None
@@ -304,7 +315,7 @@ def validate_map(obj, batch: Batch, language: str) -> MapResult:
     missing = sorted(set(expected) - set(seen))
     if missing:
         raise Invalid(f"these chunk ids are missing: {missing}; put each in one topic or in non_study")
-    return MapResult(topics, non_study)
+    return MapResult(topics, non_study, duplicates)
 
 
 @dataclass
@@ -388,12 +399,17 @@ class Estimate:
 THINKING_ALLOWANCE = 3000   # output tokens per call a reasoning model may spend thinking (rough)
 
 
+PLACE_TOPIC_LIST_TOKENS = 3000  # the topic list sent with each placement call (rough)
+
+
 def estimate(model: str, batches: list[Batch], language: str, extra_calls: int = 1,
-             token_counter: Callable[[str], int] | None = None, saved: int = 0) -> Estimate:
+             token_counter: Callable[[str], int] | None = None, saved: int = 0,
+             place_chunks: list | None = None) -> Estimate:
     """Token and cost estimate with no model call. Tokens are counted locally with
     LiteLLM's tokenizer for the model (an approximation for Gemini); output is
     estimated from the batch sizes. The first `saved` batches already have a saved
-    reply (an interrupted run) and cost nothing."""
+    reply (an interrupted run) and cost nothing. place_chunks are practice and
+    glossary chunks placed into topics after the merge."""
     import litellm
 
     if token_counter is None:
@@ -416,9 +432,16 @@ def estimate(model: str, batches: list[Batch], language: str, extra_calls: int =
         inp += extra_calls * token_counter(_prompt("topics_reduce", language="", scope="", count_rule="")) \
             + local_topics * 80 * 2
         out += max(1, local_topics // 3) * 70 + local_topics * 12
+    place_chunks = place_chunks or []
+    place_calls = math.ceil(len(place_chunks) / PLACE_BATCH_CHUNKS)
+    if place_calls:
+        inp += sum(token_counter(_chunk_xml(c)) for c in place_chunks) \
+            + place_calls * (PLACE_TOPIC_LIST_TOKENS + token_counter(_prompt("topics_place", topics="")))
+        out += len(place_chunks) * 25
     info = litellm.model_cost.get(model) or litellm.model_cost.get(model.split("/", 1)[-1]) or {}
     thinking = THINKING_ALLOWANCE if info.get("supports_reasoning") else 0
-    return Estimate(model, sum(len(b.chunks) for b in batches), len(batches), len(batches) - saved + extra_calls,
+    return Estimate(model, sum(len(b.chunks) for b in batches) + len(place_chunks), len(batches),
+                    len(batches) - saved + extra_calls + place_calls,
                     inp, out, info.get("input_cost_per_token"), info.get("output_cost_per_token"), thinking, saved)
 
 
@@ -469,12 +492,14 @@ def cached_batches(conn, model: str, batches: list[Batch], language: str) -> int
 
 
 def _run_map(conn, set_id, batches, language, model, log, completion, extra,
-             hints: list[Hint]) -> tuple[list[LocalTopic], dict[int, str]]:
+             hints: list[Hint]) -> tuple[list[LocalTopic], dict[int, str], int]:
     """Map every batch. A batch whose exact prompt was answered before (an
     interrupted or earlier run) reuses the saved reply instead of calling the model
-    again. Each local topic gets the chapter most of its chunks are in."""
+    again. Each local topic gets the chapter most of its chunks are in. Also
+    returns how many duplicate chunk listings became secondary links."""
     local: list[LocalTopic] = []
     non_study: dict[int, str] = {}
+    duplicates = 0
     previous = ""
     for b in batches:
         messages = _map_messages(b, language, previous)
@@ -491,16 +516,20 @@ def _run_map(conn, set_id, batches, language, model, log, completion, extra,
                 return result
             result, _ = complete_json(messages, model=model, purpose="topics.map", log=log,
                                       validate=validate, completion=completion, extra=extra)
+            _check(log)
             db.cache_put(conn, _cache_key(model, messages), set_id, "topics.map",
                          json.dumps(raw[-1], ensure_ascii=False))
+        if result.duplicates:
+            print(f"    {result.duplicates} chunk(s) listed in two topics: kept as secondary links", flush=True)
         rows = {c["id"]: c for c in b.chunks}
         for t in result.topics:
-            chapters = Counter(chapter_of(rows[c], hints) for c in t.chunk_ids)
+            chapters = Counter(chapter_of(rows[c], hints) for c in (t.chunk_ids or t.also_chunk_ids))
             t.chapter = chapters.most_common(1)[0][0]
         local += result.topics
         non_study.update(result.non_study)
+        duplicates += result.duplicates
         previous = result.topics[-1].title
-    return local, non_study
+    return local, non_study, duplicates
 
 
 def _local_lines(local: list[LocalTopic]) -> str:
@@ -529,8 +558,10 @@ def _premerge(local: list[LocalTopic]) -> list[LocalTopic]:
     for t in local:
         if t.title in by_title:
             by_title[t.title].chunk_ids += t.chunk_ids
+            by_title[t.title].also_chunk_ids += t.also_chunk_ids
         else:
-            by_title[t.title] = LocalTopic(t.id, t.title, t.summary, list(t.chunk_ids), t.document, t.pages, t.chapter)
+            by_title[t.title] = LocalTopic(t.id, t.title, t.summary, list(t.chunk_ids), t.document, t.pages,
+                                           t.chapter, list(t.also_chunk_ids))
             out.append(by_title[t.title])
     return out
 
@@ -660,55 +691,193 @@ def _reduce(group: Group, language, model, log, completion, extra) -> list[Final
     return final
 
 
+PRACTICE_SHARE = 0.25       # a chapter this share of question chunks is a practice section
+PLACE_BATCH_CHUNKS = 15     # chunks per placement call
+MAX_ALSO = 3                # secondary topics per placed chunk
+RETRY_BUDGET = 20           # stop a build once more than this many replies were invalid
+
+
+class RetryBudgetExceeded(LLMError):
+    pass
+
+
+class Budget:
+    """Logs every call, and stops the build once invalid replies pile up."""
+
+    def __init__(self, conn, set_id: int, limit: int = RETRY_BUDGET):
+        self.conn, self.set_id = conn, set_id
+        self.limit = limit
+        self.retries = 0
+
+    def __call__(self, record: dict) -> None:
+        db.log_llm_call(self.conn, self.set_id, record)
+        self.retries += max(record["attempts"] - 1, 0)
+
+    def check(self) -> None:
+        if self.retries > self.limit:
+            raise RetryBudgetExceeded(f"stopped after {self.retries} invalid replies (limit {self.limit}); "
+                                      "see `calls` for what was rejected")
+
+
+def _check(log) -> None:
+    getattr(log, "check", lambda: None)()
+
+
+def practice_chapters(chunks: list[sqlite3.Row], hints: list[Hint]) -> set[str]:
+    """Chapters that are mostly practice questions (e.g. an MCQ appendix)."""
+    out = set()
+    for h in hints:
+        cs = [c for c in chunks if chapter_of(c, [h])]
+        if cs and sum(protected_kind(c["text"]) == "questions" for c in cs) >= PRACTICE_SHARE * len(cs):
+            out.add(h.title)
+    return out
+
+
+def cross_cutting(chunks: list[sqlite3.Row], hints: list[Hint]) -> list[sqlite3.Row]:
+    """Chunks placed into subject topics instead of forming topics of their own:
+    those in a practice chapter, and every glossary chunk."""
+    practice = practice_chapters(chunks, hints)
+    return [c for c in chunks if chapter_of(c, hints) in practice or protected_kind(c["text"]) == "glossary"]
+
+
+@dataclass
+class ChunkPlacement:
+    chunk_id: int
+    topic: int            # index into the final topic list
+    also: list[int]
+
+
+def validate_place(obj, batch: list[sqlite3.Row], n_topics: int) -> tuple[list[ChunkPlacement], dict[int, str]]:
+    if not isinstance(obj, dict) or not isinstance(obj.get("placements"), list):
+        raise Invalid('expected {"placements": [...], "non_study": [...]}')
+    expected = {c["id"]: c for c in batch}
+    seen, out, non_study = set(), [], {}
+
+    def topic_index(tid):
+        if not isinstance(tid, int) or not 1 <= tid <= n_topics:
+            raise Invalid(f"topic id {tid!r} is not in the list (1-{n_topics})")
+        return tid - 1
+
+    for p in obj["placements"]:
+        cid = p.get("chunk_id") if isinstance(p, dict) else None
+        if cid not in expected:
+            raise Invalid(f"chunk id {cid!r} is not one of the given chunks")
+        if cid in seen:
+            raise Invalid(f"chunk {cid} placed twice")
+        seen.add(cid)
+        primary = topic_index(p.get("topic_id"))
+        also = [topic_index(t) for t in (p.get("also") or [])]
+        if primary in also:
+            raise Invalid(f"chunk {cid}: \"also\" repeats its topic_id")
+        if len(set(also)) != len(also) or len(also) > MAX_ALSO:
+            raise Invalid(f"chunk {cid}: \"also\" must list at most {MAX_ALSO} different topics")
+        out.append(ChunkPlacement(cid, primary, also))
+    for n in obj.get("non_study") or []:
+        cid = n.get("chunk_id") if isinstance(n, dict) else None
+        if cid not in expected or cid in seen:
+            raise Invalid(f"non_study chunk id {cid!r} is unknown or already placed")
+        if expected[cid]["user_choice"] == "include" or protected_kind(expected[cid]["text"]):
+            raise Invalid(f"chunk {cid} holds questions or glossary entries, which are study material; place it")
+        seen.add(cid)
+        non_study[cid] = str(n.get("reason") or "not study material")[:200]
+    missing = sorted(set(expected) - seen)
+    if missing:
+        raise Invalid(f"these chunk ids are missing: {missing}")
+    return out, non_study
+
+
+def _place(chunks, final: list[FinalTopic], model, log, completion, extra):
+    lines = "\n".join(json.dumps({"id": i, "title": t.title, "summary": t.summary, "chapter": t.chapter or ""},
+                                 ensure_ascii=False) for i, t in enumerate(final, start=1))
+    system = _prompt("topics_place", topics=lines)
+    placements, non_study = [], {}
+    batches = [chunks[i:i + PLACE_BATCH_CHUNKS] for i in range(0, len(chunks), PLACE_BATCH_CHUNKS)]
+    for k, batch in enumerate(batches, start=1):
+        print(f"  place {k}/{len(batches)}: {len(batch)} practice/glossary chunks", flush=True)
+        (p, n), _ = complete_json(
+            [{"role": "system", "content": system},
+             {"role": "user", "content": "\n\n".join(_chunk_xml(c) for c in batch)}],
+            model=model, purpose="topics.place", log=log, completion=completion, extra=extra,
+            validate=lambda obj, batch=batch: validate_place(obj, batch, len(final)))
+        _check(log)
+        placements += p
+        non_study.update(n)
+    return placements, non_study
+
+
 def build(conn: sqlite3.Connection, set_name: str, model: str, chunks: list[sqlite3.Row], *,
           force: bool = False, completion: Callable | None = None, extra: dict | None = None,
-          batch_chars: int = BATCH_CHARS) -> list[int]:
+          batch_chars: int = BATCH_CHARS, retry_budget: int = RETRY_BUDGET) -> list[int]:
     """Build (or with force, rebuild) the topic map from the given chunks. Returns topic ids.
 
-    Map replies are saved and reused: a rebuild with the same chunks and prompts
-    only reruns the routing and per-chapter merge calls (see `clear-cache`)."""
+    Subject chunks are mapped and merged per chapter; practice-question and
+    glossary chunks are then placed into those topics (with secondary links for
+    other topics they cover). Map replies are saved and reused, so a rebuild with
+    the same chunks and prompts reruns only routing, merging and placement (see
+    `clear-cache`). Nothing is stored unless every step succeeds, and the build
+    stops if invalid replies pile up."""
     study_set = _get_set(conn, set_name)
     set_id, language = study_set["id"], study_set["language"]
     if db.topics(conn, set_id) and not force:
         raise RuntimeError("This set already has a topic map; use --force to replace it (edits are lost).")
     hints = set_hints(conn, set_id)
-    batches = make_batches(chunks, hints, batch_chars)
+    cross = cross_cutting(chunks, hints)
+    cross_ids = {c["id"] for c in cross}
+    subject = [c for c in chunks if c["id"] not in cross_ids]
+    batches = make_batches(subject, hints, batch_chars)
     if not batches:
         raise RuntimeError("No chunks selected.")
+    log = Budget(conn, set_id, retry_budget)
 
-    def log(record):
-        db.log_llm_call(conn, set_id, record)
-
-    local, non_study = _run_map(conn, set_id, batches, language, model, log, completion, extra, hints)
-    chapters = list(dict.fromkeys(h.title for h in hints if any(chapter_of(c, [h]) for c in chunks)))
+    local, non_study, duplicates = _run_map(conn, set_id, batches, language, model, log, completion, extra, hints)
+    if duplicates:
+        print(f"  duplicates converted to secondary links: {duplicates}", flush=True)
+    practice = practice_chapters(chunks, hints)
+    chapters = list(dict.fromkeys(h.title for h in hints
+                                  if h.title not in practice and any(chapter_of(c, [h]) for c in subject)))
     _route(local, chapters, language, model, log, completion, extra)
+    _check(log)
     groups = plan_groups(local, chapters, bool(hints))
-    final_by_group = [(g, _reduce(g, language, model, log, completion, extra)) for g in groups]
+    final_by_group = []
+    for g in groups:
+        final_by_group.append((g, _reduce(g, language, model, log, completion, extra)))
+        _check(log)
+    final = [t for _, ts in final_by_group for t in ts]
+    placements, place_non_study = _place(cross, final, model, log, completion, extra) if cross else ([], {})
 
     ids = []
     with conn:
         if force:
             db.clear_topic_map(conn, set_id)
-        for cid, reason in non_study.items():
+        for cid, reason in {**non_study, **place_non_study}.items():
             db.set_excluded(conn, cid, reason)
-        pos = 0
-        for g, final in final_by_group:
+        for g, ts in final_by_group:
             by_id = {t.id: t for t in g.local}
-            for t in final:
-                tid = db.add_topic(conn, set_id, t.title, t.summary, t.chapter, pos)
-                db.link_chunks(conn, tid, [c for lid in t.local_ids for c in by_id[lid].chunk_ids])
+            for t in ts:
+                tid = db.add_topic(conn, set_id, t.title, t.summary, t.chapter, len(ids))
+                primary = [c for lid in t.local_ids for c in by_id[lid].chunk_ids]
+                db.link_chunks(conn, tid, primary)
+                also = {c for lid in t.local_ids for c in by_id[lid].also_chunk_ids} - set(primary)
+                db.link_chunks(conn, tid, sorted(also), primary=False)
                 ids.append(tid)
-                pos += 1
+        for p in placements:
+            db.link_chunks(conn, ids[p.topic], [p.chunk_id])
+            for a in p.also:
+                db.link_chunks(conn, ids[a], [p.chunk_id], primary=False)
     return ids
 
 
 def planned_calls(chunks: list[sqlite3.Row], hints: list[Hint]) -> int:
-    """Calls after the map: one route call if some chunks have no chapter while
-    others do, plus one merge per chapter and one for material outside chapters."""
-    chapters = {chapter_of(c, hints) for c in chunks}
-    named = {c for c in chapters if c}
+    """Calls after the map: one route call if some subject chunks have no chapter
+    while others do, one merge per chapter (practice chapters excepted) and one for
+    material outside chapters, then placement calls for practice/glossary chunks."""
+    cross = {c["id"] for c in cross_cutting(chunks, hints)}
+    practice = practice_chapters(chunks, hints)
+    subject = [c for c in chunks if c["id"] not in cross]
+    chapters = {chapter_of(c, hints) for c in subject}
+    named = {c for c in chapters if c and c not in practice}
     route = 1 if named and None in chapters else 0
-    return route + len(named) + (1 if None in chapters else 0)
+    return route + len(named) + (1 if None in chapters else 0) + math.ceil(len(cross) / PLACE_BATCH_CHUNKS)
 
 
 def assign(conn: sqlite3.Connection, set_name: str, model: str, *, completion: Callable | None = None,
@@ -728,7 +897,7 @@ def assign(conn: sqlite3.Connection, set_name: str, model: str, *, completion: C
     def log(record):
         db.log_llm_call(conn, set_id, record)
 
-    local, non_study = _run_map(conn, set_id, make_batches(chunks, hints, batch_chars), language, model, log,
+    local, non_study, _ = _run_map(conn, set_id, make_batches(chunks, hints, batch_chars), language, model, log,
                                 completion, extra, hints)
     existing_lines = "\n".join(json.dumps({"id": t["id"], "title": t["title"], "summary": t["summary"]},
                                           ensure_ascii=False) for t in db.topics(conn, set_id))
@@ -753,6 +922,7 @@ def assign(conn: sqlite3.Connection, set_name: str, model: str, *, completion: C
                     position += 1
                 tid = new_topics[p.new_title]
             db.link_chunks(conn, tid, by_id[p.local_id].chunk_ids)
+            db.link_chunks(conn, tid, by_id[p.local_id].also_chunk_ids, primary=False)
             placed += len(by_id[p.local_id].chunk_ids)
     return placed, len(new_topics)
 
@@ -887,12 +1057,16 @@ def main(argv: list[str] | None = None) -> None:
         model = _model(args)
         chunks = select_chunks(conn, s["id"], parse_only(args.only) if args.only else None, args.chapter)
         hints = set_hints(conn, s["id"])
-        batches = make_batches(chunks, hints, args.batch_chars)
+        # Mirror build(): practice/glossary chunks are placed, the rest is mapped.
+        cross = cross_cutting(chunks, hints)
+        cross_ids = {c["id"] for c in cross}
+        batches = make_batches([c for c in chunks if c["id"] not in cross_ids], hints, args.batch_chars)
         if args.command == "build" and args.fresh:
             with conn:
                 db.cache_clear(conn, s["id"])
-        e = estimate(model, batches, s["language"], extra_calls=planned_calls(chunks, hints),
-                     saved=cached_batches(conn, model, batches, s["language"]))
+        place_calls = math.ceil(len(cross) / PLACE_BATCH_CHUNKS)
+        e = estimate(model, batches, s["language"], extra_calls=planned_calls(chunks, hints) - place_calls,
+                     saved=cached_batches(conn, model, batches, s["language"]), place_chunks=cross)
         if args.command == "estimate":
             print(describe(e))
             return
