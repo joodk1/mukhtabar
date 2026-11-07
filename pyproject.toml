@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mukhtabar"
+version = "0.0.1"
+description = "A study buddy that quizzes you on your own material and drills your weakest topics."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = ["pdfplumber"]
+
+[project.optional-dependencies]
+# The other extractors, only for re-running the milestone 0 comparison.
+spike = [
+    "pypdf",
+    "pypdfium2",
+    "pymupdf",
+]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["mukhtabar*"]
