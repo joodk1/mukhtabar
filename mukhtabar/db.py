@@ -48,6 +48,44 @@ MIGRATIONS = [
         UNIQUE (document_id, position)
     );
     """,
+    # 2: topic map (milestone 2)
+    """
+    CREATE TABLE topics (
+        id           INTEGER PRIMARY KEY,
+        study_set_id INTEGER NOT NULL REFERENCES study_sets(id) ON DELETE CASCADE,
+        title        TEXT NOT NULL,
+        summary      TEXT NOT NULL DEFAULT '',
+        chapter      TEXT,
+        position     INTEGER NOT NULL,
+        edited       INTEGER NOT NULL DEFAULT 0,
+        created_at   TEXT NOT NULL,
+        updated_at   TEXT NOT NULL
+    );
+    CREATE TABLE topic_chunks (
+        topic_id   INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+        chunk_id   INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+        is_primary INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY (topic_id, chunk_id)
+    );
+    -- At most one primary topic per chunk; secondary links can be added later.
+    CREATE UNIQUE INDEX one_primary_topic_per_chunk ON topic_chunks (chunk_id) WHERE is_primary = 1;
+    ALTER TABLE chunks ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE chunks ADD COLUMN excluded_reason TEXT;
+    CREATE TABLE llm_calls (
+        id            INTEGER PRIMARY KEY,
+        study_set_id  INTEGER REFERENCES study_sets(id) ON DELETE SET NULL,
+        purpose       TEXT NOT NULL,
+        model         TEXT NOT NULL,
+        input_tokens  INTEGER,
+        output_tokens INTEGER,
+        cost_usd      REAL,
+        attempts      INTEGER NOT NULL,
+        ok            INTEGER NOT NULL,
+        error         TEXT,
+        seconds       REAL,
+        created_at    TEXT NOT NULL
+    );
+    """,
 ]
 
 
@@ -134,3 +172,110 @@ def chunks(conn: sqlite3.Connection, document_id: int) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM chunks WHERE document_id = ? ORDER BY position", (document_id,)
     ).fetchall()
+
+
+# --- Topics (milestone 2) ---
+
+def study_chunks(conn: sqlite3.Connection, study_set_id: int) -> list[sqlite3.Row]:
+    """All chunks of a set with their document, in document and position order."""
+    return conn.execute(
+        """SELECT c.*, d.filename FROM chunks c JOIN documents d ON d.id = c.document_id
+           WHERE c.study_set_id = ? ORDER BY d.id, c.position""", (study_set_id,)
+    ).fetchall()
+
+
+def topics(conn: sqlite3.Connection, study_set_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        """SELECT t.*, COUNT(tc.chunk_id) AS n_chunks FROM topics t
+           LEFT JOIN topic_chunks tc ON tc.topic_id = t.id
+           WHERE t.study_set_id = ? GROUP BY t.id ORDER BY t.position, t.id""", (study_set_id,)
+    ).fetchall()
+
+
+def get_topic(conn: sqlite3.Connection, topic_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM topics WHERE id = ?", (topic_id,)).fetchone()
+
+
+def add_topic(conn: sqlite3.Connection, study_set_id: int, title: str, summary: str,
+              chapter: str | None, position: int) -> int:
+    now = _now()
+    cur = conn.execute(
+        """INSERT INTO topics (study_set_id, title, summary, chapter, position, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""", (study_set_id, title, summary, chapter, position, now, now)
+    )
+    return cur.lastrowid
+
+
+def update_topic(conn: sqlite3.Connection, topic_id: int, **fields) -> None:
+    fields = {**fields, "edited": 1, "updated_at": _now()}
+    sets = ", ".join(f"{k} = ?" for k in fields)
+    conn.execute(f"UPDATE topics SET {sets} WHERE id = ?", (*fields.values(), topic_id))
+
+
+def delete_topic(conn: sqlite3.Connection, topic_id: int) -> None:
+    conn.execute("DELETE FROM topics WHERE id = ?", (topic_id,))
+
+
+def link_chunks(conn: sqlite3.Connection, topic_id: int, chunk_ids: list[int]) -> None:
+    conn.executemany(
+        "INSERT INTO topic_chunks (topic_id, chunk_id, is_primary) VALUES (?, ?, 1)",
+        [(topic_id, c) for c in chunk_ids],
+    )
+
+
+def move_links(conn: sqlite3.Connection, from_topic: int, to_topic: int) -> None:
+    conn.execute("UPDATE topic_chunks SET topic_id = ? WHERE topic_id = ?", (to_topic, from_topic))
+
+
+def topic_chunk_rows(conn: sqlite3.Connection, topic_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        """SELECT c.*, d.filename FROM topic_chunks tc JOIN chunks c ON c.id = tc.chunk_id
+           JOIN documents d ON d.id = c.document_id WHERE tc.topic_id = ? ORDER BY d.id, c.position""",
+        (topic_id,),
+    ).fetchall()
+
+
+def unassigned_chunks(conn: sqlite3.Connection, study_set_id: int) -> list[sqlite3.Row]:
+    """Study chunks (not excluded) with no primary topic."""
+    return conn.execute(
+        """SELECT c.*, d.filename FROM chunks c JOIN documents d ON d.id = c.document_id
+           WHERE c.study_set_id = ? AND c.excluded = 0
+             AND NOT EXISTS (SELECT 1 FROM topic_chunks tc WHERE tc.chunk_id = c.id AND tc.is_primary = 1)
+           ORDER BY d.id, c.position""", (study_set_id,)
+    ).fetchall()
+
+
+def set_excluded(conn: sqlite3.Connection, chunk_id: int, reason: str | None) -> None:
+    conn.execute("UPDATE chunks SET excluded = ?, excluded_reason = ? WHERE id = ?",
+                 (1 if reason else 0, reason, chunk_id))
+
+
+def clear_topic_map(conn: sqlite3.Connection, study_set_id: int) -> None:
+    """Delete a set's topics (links go with them) and the model's exclusions."""
+    conn.execute("DELETE FROM topics WHERE study_set_id = ?", (study_set_id,))
+    conn.execute("UPDATE chunks SET excluded = 0, excluded_reason = NULL WHERE study_set_id = ?", (study_set_id,))
+
+
+def linked_chunk_count(conn: sqlite3.Connection, document_id: int) -> tuple[int, int]:
+    """(chunks of this document linked to a topic, distinct topics they're linked to)."""
+    row = conn.execute(
+        """SELECT COUNT(DISTINCT tc.chunk_id), COUNT(DISTINCT tc.topic_id) FROM topic_chunks tc
+           JOIN chunks c ON c.id = tc.chunk_id WHERE c.document_id = ?""", (document_id,)
+    ).fetchone()
+    return row[0], row[1]
+
+
+def empty_topics(conn: sqlite3.Connection, study_set_id: int) -> list[sqlite3.Row]:
+    return [t for t in topics(conn, study_set_id) if t["n_chunks"] == 0]
+
+
+def log_llm_call(conn: sqlite3.Connection, study_set_id: int | None, record: dict) -> None:
+    conn.execute(
+        """INSERT INTO llm_calls (study_set_id, purpose, model, input_tokens, output_tokens, cost_usd,
+                                  attempts, ok, error, seconds, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (study_set_id, record["purpose"], record["model"], record.get("input_tokens"),
+         record.get("output_tokens"), record.get("cost_usd"), record["attempts"], int(record["ok"]),
+         record.get("error"), record.get("seconds"), _now()),
+    )
+    conn.commit()

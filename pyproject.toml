@@ -8,7 +8,11 @@ version = "0.0.1"
 description = "A study buddy that quizzes you on your own material and drills your weakest topics."
 requires-python = ">=3.11"
 license = { text = "MIT" }
-dependencies = ["pdfplumber"]
+dependencies = [
+    "pdfplumber",
+    "litellm>=1.106.2,<2",
+    "python-dotenv>=1.2",
+]
 
 [project.optional-dependencies]
 # The other extractors, only for re-running the milestone 0 comparison.
@@ -22,6 +26,9 @@ dev = ["pytest", "pypdf", "fpdf2"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+mukhtabar = ["prompts/*.txt"]
 
 [tool.setuptools.packages.find]
 include = ["mukhtabar*"]

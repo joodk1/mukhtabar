@@ -1,7 +1,7 @@
 """Command-line ingest, until the UI exists.
 
     python -m mukhtabar.ingest add --set NAME [--language ar] FILE.pdf ...
-    python -m mukhtabar.ingest rechunk --set NAME [--chunk-chars 1000]
+    python -m mukhtabar.ingest rechunk --set NAME [--chunk-chars 1000] [--force]
     python -m mukhtabar.ingest removed --set NAME
 """
 
@@ -11,7 +11,7 @@ import sys
 
 from mukhtabar import db
 from mukhtabar.ingest.chunk import TARGET_CHARS
-from mukhtabar.ingest.pipeline import ingest_pdf, rechunk
+from mukhtabar.ingest.pipeline import RechunkRefused, ingest_pdf, rechunk
 
 
 def _add(conn, args) -> None:
@@ -31,11 +31,23 @@ def _add(conn, args) -> None:
                 print(f"    {n:4d} pages, {side}: {text}")
         if r.language == "und":
             print("  could not tell the language; set it with --language")
+        study_set = db.get_study_set(conn, args.set)
+        if db.topics(conn, study_set["id"]):
+            print("  this set has a topic map; place the new chunks with: python -m mukhtabar.topics assign")
 
 
 def _rechunk(conn, args) -> None:
-    for filename, n in rechunk(conn, args.set, args.chunk_chars).items():
+    try:
+        counts = rechunk(conn, args.set, args.chunk_chars, force=args.force)
+    except RechunkRefused as e:
+        sys.exit(str(e))
+    for filename, n in counts.items():
         print(f"{filename}: {n} chunks")
+    study_set = db.get_study_set(conn, args.set)
+    empty = db.empty_topics(conn, study_set["id"])
+    if empty:
+        print(f"{len(empty)} topics now have no chunks (python -m mukhtabar.topics list --empty); "
+              "place the new chunks with: python -m mukhtabar.topics assign")
 
 
 def _removed(conn, args) -> None:
@@ -63,6 +75,7 @@ def main(argv: list[str] | None = None) -> None:
     re_ = sub.add_parser("rechunk", help="rebuild chunks from stored pages")
     re_.add_argument("--set", required=True)
     re_.add_argument("--chunk-chars", type=int, default=TARGET_CHARS)
+    re_.add_argument("--force", action="store_true", help="also delete topic links to the replaced chunks")
 
     rm = sub.add_parser("removed", help="list header/footer lines removed at ingest")
     rm.add_argument("--set", required=True)

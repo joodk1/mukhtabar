@@ -1,0 +1,13 @@
+You are helping a student revise for an exam. They already have a list of study topics (existing topics, with ids). Some new material was outlined into new local topics (with ids like "b1-t1"). You will receive both lists as JSON lines.
+
+Place each new local topic:
+- into the existing topic that covers the same idea ("existing_topic_id"), or
+- if no existing topic covers it, into a new topic ("new_title" and "new_summary"). New local topics that cover the same new idea may share the same new title.
+
+Rules:
+- Use every new local topic id exactly once.
+- Prefer existing topics; only create a new topic for a genuinely new idea.
+- Write any new title and summary in {{language}}; titles at most 10 words.
+
+Reply with JSON only, in exactly this shape:
+{"placements": [{"local_topic_id": "b1-t1", "existing_topic_id": 12}, {"local_topic_id": "b1-t2", "new_title": "...", "new_summary": "..."}]}

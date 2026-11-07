@@ -1,6 +1,6 @@
 # Milestone 2 proposal: topic map
 
-Status: proposal for review. Nothing here is implemented yet.
+Status: implemented in milestone 2, apart from the differences noted under "As built" at the end.
 
 ## Goal
 
@@ -79,9 +79,8 @@ is built in passes.
   Milestone 2 recomputes them from the stored pages: a line that opens at least 3
   pages of a document is a candidate, ordered by first appearance, with the page
   range it covers.
-- **Fallback:** for documents without running titles (the summary and the question
-  bank have none), section headings that start with a section number such as `3-1`
-  are used instead. If neither exists, there are no hints.
+- **Documents without running titles** (the summary and the question bank) get no
+  hints; the reduce step places their topics under the main document's chapters.
 - **How they're used:**
   - map batches are cut at chapter boundaries where possible;
   - each batch is told which chapter it's in;
@@ -346,3 +345,21 @@ assignments and granularity. Ties go to fewer retries.
    ceiling of 60?
 3. **Which provider and models** for the comparison. The material itself is sent to
    that provider.
+
+## As built (milestone 2)
+
+- **Chapter hints:** only running titles are used; the numbered-heading fallback isn't
+  built. Some documents mark chapters with banners such as "Chapter N:", which would
+  be a better fallback later. A title only counts as a running title if it appears on
+  nearby pages (at most 2 apart), so a label scattered across a document isn't taken
+  for a chapter.
+- **Retries:** rate limits are retried at most 3 times (10s, 30s, 60s, or the delay
+  the provider suggests, up to 90s), and temporary server errors at most twice.
+  Exhausted quota stops at once. LiteLLM's own retries are turned off, so the limit is
+  exact.
+- **Safety:** error messages are redacted before they're printed or logged, because a
+  request URL can carry the API key. `build` and `assign` print the model and the
+  estimate, and only call the model after confirmation or `--yes`.
+- **Trying models:** `--chapter N` and `--only FILE:FIRST-LAST` limit a build to part
+  of a set. `estimate` shows calls, tokens and cost without calling anything.
+  `spikes/compare_topics.py` puts several models' maps side by side.

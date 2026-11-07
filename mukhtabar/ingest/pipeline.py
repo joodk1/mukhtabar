@@ -97,12 +97,28 @@ def ingest_pdf(conn: sqlite3.Connection, set_name: str, path: str | Path,
     return result
 
 
-def rechunk(conn: sqlite3.Connection, set_name: str, target_chars: int = TARGET_CHARS) -> dict[str, int]:
+class RechunkRefused(RuntimeError):
+    pass
+
+
+def rechunk(conn: sqlite3.Connection, set_name: str, target_chars: int = TARGET_CHARS,
+            force: bool = False) -> dict[str, int]:
     """Rebuild every document's chunks from the stored pages (no re-extraction).
-    Returns chunk counts by filename."""
+    Returns chunk counts by filename.
+
+    Replacing chunks removes their topic links, so this refuses while any of a
+    document's chunks are linked to a topic, unless force is set. With force, the
+    links are deleted; topics left without chunks are kept for the user to review."""
     study_set = db.get_study_set(conn, set_name)
     if study_set is None:
         raise ValueError(f"No study set named {set_name!r}")
+    if not force:
+        linked = [(d["filename"], *db.linked_chunk_count(conn, d["id"])) for d in db.documents(conn, study_set["id"])]
+        linked = [row for row in linked if row[1]]
+        if linked:
+            details = "; ".join(f"{n} chunks of {f} are linked to {t} topics" for f, n, t in linked)
+            raise RechunkRefused(f"Refusing: {details}. Rechunking replaces chunks and would remove those links. "
+                                 "Re-run with --force to delete these topic links and rechunk.")
     counts = {}
     with conn:
         for doc in db.documents(conn, study_set["id"]):
