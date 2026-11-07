@@ -43,12 +43,14 @@ Arabic-first, but it isn't tied to one language. Works with any model provider.
 - Arabic PDFs store text in logical order (e.g. InDesign) or visual order (e.g. Word). Plain extractors each fail on one kind, so reading order is rebuilt from glyph positions.
 - Brackets are stored by shape in some PDFs and by meaning in others; this is decided per page.
 - Two-column pages are split at a central gutter; ruled tables are read cell by cell. Pages that look multi-column without a clear gutter are laid out as one column and flagged.
+- Lines are grouped by baseline, not glyph box (an Arabic font's boxes are much taller than a Latin font's). Words in the side margins (e.g. a chapter-number tab) are laid out separately at the end of the page.
 - Known limits: digit/punctuation sequences such as `10-1-1` or `24 ÷ 6 = 4` keep visual order; a grid of boxes is read column by column rather than row by row; tables without ruling lines aren't detected.
 - Ingest must compare filenames in NFC form: Arabic names typed by hand can be composed differently from the names on disk.
 
 ## Testing
 
 - `samples_private/` won't exist for other people, so public tests use tiny synthetic Arabic PDFs in `tests/fixtures/`, one stored in logical order and one in visual order, covering لا ligatures, brackets, English/number runs, two columns, and a table.
+- The fixtures are generated from original text by `tests/fixtures/make_fixtures.py` (fpdf2, dev only) with Noto Naskh Arabic (OFL, license in `tests/fixtures/OFL.txt`; the font file itself isn't committed). A test checks they still reproduce the real failure under naive pypdf (reversed word order on the visual file), so they stay representative.
 
 ## Folder layout
 

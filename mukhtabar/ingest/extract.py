@@ -106,6 +106,11 @@ def normalize(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
     text = HARAKAT.sub("", text.replace(TATWEEL, ""))
     text = re.sub(r"[ \t]+", " ", text)
+    # Glyphs from a second font (e.g. Latin brackets) can come out as separate words.
+    # Only tighten brackets that sit where an opening/closing bracket belongs, so a
+    # misoriented one never glues two words together.
+    text = re.sub(r"(^|(?<= ))([(\[«]) ", r"\2", text, flags=re.M)
+    text = re.sub(r" ([)\]»])(?=$|[ .,،؛:؟!])", r"\1", text, flags=re.M)
     return "\n".join(line.strip() for line in text.splitlines())
 
 

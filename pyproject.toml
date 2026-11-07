@@ -17,7 +17,8 @@ spike = [
     "pypdfium2",
     "pymupdf",
 ]
-dev = ["pytest"]
+# pypdf: checks the fixtures still fool a naive extractor; fpdf2: regenerates them.
+dev = ["pytest", "pypdf", "fpdf2"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -34,6 +34,7 @@ FLAG_COLUMNS = "possible-columns-not-split"
 # Column detection, in PDF points.
 MIN_GUTTER = 6
 WIDE_GAP = 25
+SIDE_MARGIN = 0.05  # share of the page width
 
 
 def _reverse_runs(items: list, in_run) -> list:
@@ -92,18 +93,24 @@ def _line_text(words: list[dict]) -> str:
     return " ".join(out)
 
 
+def _baseline(w: dict) -> float:
+    """Distance from the page top to the word's baseline. Glyph boxes differ by
+    font (an Arabic font's are much taller than a Latin one's); baselines don't."""
+    return -w["chars"][0]["matrix"][5]
+
+
 def _cluster_lines(words: list[dict]) -> list[list[dict]]:
     if not words:
         return []
     tol = max(2.0, 0.4 * statistics.median(w["bottom"] - w["top"] for w in words))
     lines: list[list[dict]] = []
     ref = None
-    for w in sorted(words, key=lambda w: w["bottom"]):
-        if ref is not None and abs(w["bottom"] - ref) < tol:
+    for w in sorted(words, key=_baseline):
+        if ref is not None and abs(_baseline(w) - ref) < tol:
             lines[-1].append(w)
         else:
             lines.append([w])
-            ref = w["bottom"]
+            ref = _baseline(w)
     return lines
 
 
@@ -132,6 +139,18 @@ def _find_gutter(words: list[dict], width: float, n_lines: int) -> tuple[float, 
     if min(right, len(words) - right) < 0.15 * len(words):
         return None
     return best
+
+
+def _spans(line: list[dict], mid: float) -> bool:
+    """Whether a line runs across the gutter (a full-width heading or sentence)
+    rather than being two column lines that share a baseline. A word may cover
+    the gutter's middle, or the middle may fall in an ordinary gap between words;
+    two columns leave a wide gap there."""
+    if any(w["x0"] < mid < w["x1"] for w in line):
+        return True
+    left = [w["x1"] for w in line if w["x1"] <= mid]
+    right = [w["x0"] for w in line if w["x0"] >= mid]
+    return bool(left and right) and min(right) - max(left) < WIDE_GAP
 
 
 def _looks_multicolumn(lines: list[list[dict]]) -> bool:
@@ -202,6 +221,11 @@ def layout_page(page) -> tuple[list[tuple[str, float, float]], list[str]]:
         o.get("object_type") == "char" and o["text"] and all(ch in MARKS for ch in o["text"])
     ))
     words = page.extract_words(return_chars=True, x_tolerance=1.5)
+    # Words entirely in the side margins (e.g. a chapter-number tab) can share a
+    # baseline with body text; lay them out on their own, after the page body.
+    margin = [w for w in words
+              if not SIDE_MARGIN * page.width <= (w["x0"] + w["x1"]) / 2 <= (1 - SIDE_MARGIN) * page.width]
+    words = [w for w in words if w not in margin]
     tables = sorted(page.find_tables(), key=lambda t: t.bbox[1])
     out: list[tuple[str, float, float]] = []
     flags: list[str] = []
@@ -216,6 +240,7 @@ def layout_page(page) -> tuple[list[tuple[str, float, float]], list[str]]:
         if table:
             out += _table_lines(table, [w for w in words if _inside(w, table.bbox)])
             top = table.bbox[3]
+    out += [_positioned(l) for l in _cluster_lines(margin)]
     return out, flags
 
 
@@ -233,7 +258,7 @@ def _layout_flow(words: list[dict], width: float) -> tuple[list[tuple[str, float
     right: list[dict] = []
     left: list[dict] = []
     for line in lines:
-        if any(w["x0"] < g1 and w["x1"] > g0 for w in line):
+        if _spans(line, mid):
             # A full-width line (e.g. a heading) closes the columns above it.
             ordered += _cluster_lines(right) + _cluster_lines(left)
             right, left = [], []
