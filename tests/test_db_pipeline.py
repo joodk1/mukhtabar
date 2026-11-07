@@ -7,7 +7,7 @@ from mukhtabar.ingest import pipeline
 from mukhtabar.ingest.extract import Line, Page
 from mukhtabar.ingest.pipeline import guess_language, ingest_pdf, rechunk
 
-SENTENCE = "تعد الأسواق المالية حلقة الوصل بين المدخرين والمستثمرين في الاقتصاد."
+SENTENCE = "يشرح هذا الدرس طريقة حساب العائد على الاستثمار خطوة بخطوة."
 
 
 @pytest.fixture
@@ -38,10 +38,10 @@ def test_migrate_sets_version_and_is_idempotent(tmp_path):
 
 
 def test_ingest_stores_document_pages_and_chunks(conn, fake_pdf):
-    r = ingest_pdf(conn, "CME", fake_pdf("book.pdf"))
+    r = ingest_pdf(conn, "Set A", fake_pdf("book.pdf"))
     assert (r.language, r.pages, r.removed_lines) == ("ar", 3, 3)
     assert r.chunks > 0
-    doc = db.documents(conn, db.get_study_set(conn, "CME")["id"])[0]
+    doc = db.documents(conn, db.get_study_set(conn, "Set A")["id"])[0]
     stored = db.pages(conn, doc["id"])
     assert [p["page"] for p in stored] == [1, 2, 3]
     assert json.loads(stored[0]["removed"]) == ["1"]
@@ -52,14 +52,16 @@ def test_ingest_stores_document_pages_and_chunks(conn, fake_pdf):
 
 def test_same_file_twice_is_skipped(conn, fake_pdf):
     path = fake_pdf("book.pdf")
-    ingest_pdf(conn, "CME", path)
-    assert ingest_pdf(conn, "CME", path).skipped
+    ingest_pdf(conn, "Set A", path)
+    assert ingest_pdf(conn, "Set A", path).skipped
 
 
 def test_filename_stored_in_nfc(conn, fake_pdf):
-    decomposed = "المجمّعة.pdf"  # shadda as a separate code point, as some filesystems keep it
-    r = ingest_pdf(conn, "CME", fake_pdf(decomposed))
     import unicodedata
+    # Shadda before fatha: a valid but non-canonical order that NFC rewrites.
+    decomposed = "المعدَّل.pdf"
+    assert unicodedata.normalize("NFC", decomposed) != decomposed
+    r = ingest_pdf(conn, "Set A", fake_pdf(decomposed))
     assert r.filename == unicodedata.normalize("NFC", decomposed)
 
 
@@ -71,16 +73,16 @@ def test_language_override_and_update(conn, fake_pdf):
 
 
 def test_rechunk_uses_stored_pages(conn, fake_pdf, monkeypatch):
-    ingest_pdf(conn, "CME", fake_pdf("book.pdf"))
+    ingest_pdf(conn, "Set A", fake_pdf("book.pdf"))
     monkeypatch.setattr(pipeline, "extract_pages", lambda p: pytest.fail("rechunk must not re-extract"))
-    small = rechunk(conn, "CME", target_chars=150)
-    large = rechunk(conn, "CME", target_chars=5000)
+    small = rechunk(conn, "Set A", target_chars=150)
+    large = rechunk(conn, "Set A", target_chars=5000)
     assert small["book.pdf"] > large["book.pdf"] == 1
 
 
 @pytest.mark.parametrize("text, expected", [
-    ("تعد الأسواق المالية حلقة الوصل بين المدخرين والمستثمرين", "ar"),
-    ("مؤشر داو جونز (DJIA) و NASDAQ و S&P 500 في الولايات المتحدة", "ar"),
+    ("يشرح هذا الدرس طريقة حساب العائد خطوة بخطوة", "ar"),
+    ("يقارن الدرس بين مؤشرين (ABC) و XYZ 100 في سوقين مختلفتين", "ar"),
     ("The market is a place for buyers and sellers of the assets", "en"),
     ("Le marché financier est un lieu de rencontre", "und"),
     ("12 34", "und"),
