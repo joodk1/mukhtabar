@@ -138,6 +138,24 @@ MIGRATIONS = [
         PRIMARY KEY (study_set_id, chapter)
     );
     """,
+    # 8: quiz sessions and per-topic mastery (milestone 4)
+    """
+    CREATE TABLE sessions (
+        id           INTEGER PRIMARY KEY,
+        study_set_id INTEGER NOT NULL REFERENCES study_sets(id) ON DELETE CASCADE,
+        kind         TEXT NOT NULL,              -- 'fixed' or 'adaptive' diagnostic (later: practice, mock)
+        planned      INTEGER NOT NULL,           -- number of questions planned
+        started_at   TEXT NOT NULL,
+        finished_at  TEXT
+    );
+    ALTER TABLE attempts ADD COLUMN session_id INTEGER REFERENCES sessions(id) ON DELETE SET NULL;
+    CREATE TABLE mastery (
+        topic_id   INTEGER PRIMARY KEY REFERENCES topics(id) ON DELETE CASCADE,
+        score      REAL NOT NULL,                -- 0-1, recent answers count more
+        attempts   INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    """,
 ]
 
 
@@ -442,3 +460,55 @@ def chapters(conn: sqlite3.Connection, study_set_id: int) -> list[str]:
 
 def questions(conn: sqlite3.Connection, topic_id: int) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM questions WHERE topic_id = ? ORDER BY id", (topic_id,)).fetchall()
+
+
+# --- Quiz sessions, attempts and mastery (milestone 4) ---
+
+def start_session(conn: sqlite3.Connection, study_set_id: int, kind: str, planned: int) -> int:
+    cur = conn.execute("INSERT INTO sessions (study_set_id, kind, planned, started_at) VALUES (?, ?, ?, ?)",
+                       (study_set_id, kind, planned, _now()))
+    return cur.lastrowid
+
+
+def finish_session(conn: sqlite3.Connection, session_id: int) -> None:
+    conn.execute("UPDATE sessions SET finished_at = ? WHERE id = ?", (_now(), session_id))
+
+
+def add_attempt(conn: sqlite3.Connection, question_id: int, response: str, score: float,
+                session_id: int | None) -> int:
+    cur = conn.execute("INSERT INTO attempts (question_id, response, score, answered_at, session_id) VALUES (?, ?, ?, ?, ?)",
+                       (question_id, response, score, _now(), session_id))
+    return cur.lastrowid
+
+
+def topic_attempts(conn: sqlite3.Connection, topic_id: int) -> list[sqlite3.Row]:
+    """A topic's answers, oldest first."""
+    return conn.execute(
+        """SELECT a.* FROM attempts a JOIN questions q ON q.id = a.question_id
+           WHERE q.topic_id = ? ORDER BY a.answered_at, a.id""", (topic_id,)
+    ).fetchall()
+
+
+def set_mastery(conn: sqlite3.Connection, topic_id: int, score: float, attempts: int) -> None:
+    conn.execute("INSERT OR REPLACE INTO mastery (topic_id, score, attempts, updated_at) VALUES (?, ?, ?, ?)",
+                 (topic_id, score, attempts, _now()))
+
+
+def mastery_rows(conn: sqlite3.Connection, study_set_id: int) -> dict[int, sqlite3.Row]:
+    return {r["topic_id"]: r for r in conn.execute(
+        "SELECT m.* FROM mastery m JOIN topics t ON t.id = m.topic_id WHERE t.study_set_id = ?", (study_set_id,))}
+
+
+def answered_question_ids(conn: sqlite3.Connection, study_set_id: int) -> dict[int, str]:
+    """Question id -> when it was last answered, for questions answered at least once."""
+    return dict(conn.execute(
+        """SELECT a.question_id, MAX(a.answered_at) FROM attempts a JOIN questions q ON q.id = a.question_id
+           JOIN topics t ON t.id = q.topic_id WHERE t.study_set_id = ? GROUP BY a.question_id""", (study_set_id,)))
+
+
+def set_questions(conn: sqlite3.Connection, study_set_id: int) -> list[sqlite3.Row]:
+    """Every question of a set with its topic's chapter."""
+    return conn.execute(
+        """SELECT q.*, t.chapter, t.title AS topic_title FROM questions q JOIN topics t ON t.id = q.topic_id
+           WHERE t.study_set_id = ? ORDER BY t.position, q.id""", (study_set_id,)
+    ).fetchall()

@@ -70,7 +70,9 @@ mukhtabar/
     questions.py         # generate grounded MCQs, with source refs and evidence
     grading.py           # MCQ exact match
     mastery.py           # per-topic scores + spaced-repetition schedule
-    selection.py         # fixed and adaptive "what to ask next"
+    selection.py         # fixed and adaptive "what to ask next", exam points, weakness report
+    quiz.py              # terminal quiz: diagnostics and the weakness report (until the UI)
+    display.py           # Arabic for terminals that don't shape or reorder it
     db.py                # SQLite schema + queries
   tests/                 # run with a mocked LLM, no API calls
     fixtures/            # tiny synthetic Arabic PDFs, logical and visual order
@@ -95,18 +97,26 @@ Each study set lives in its own folder/record: its material, chunks, topics, que
 
 ## Mastery model
 
-- Each topic has a score from 0 to 1, updated after every answer with an exponentially weighted average, so recent answers count more.
-- Track attempt count too. A score from 2 answers is less trustworthy than one from 20.
-- Spaced repetition: simple Leitner / SM-2-lite. Correct answers push the next review further out, wrong answers pull it back.
+- Each topic has a score from 0 to 1, updated after every answer with an exponentially weighted average (α = 0.3, starting from 0.5 = unknown), so recent answers count more.
+- Track attempt count too. A score from 2 answers is less trustworthy than one from 20; below 4 answers it's shown as provisional.
+- Spaced repetition (milestone 4, stage 2): Leitner boxes with review intervals of 1, 3, 7, 14 and 30 days. A topic moves between boxes by its **mastery score**, not by one session's percentage, and only once it has at least 3 answers.
 - Scheduling is **per topic, by design**, not per question. The goal is retained understanding of a topic, and questions are drawn fresh (or from cache) each review, so a per-question schedule isn't needed.
 - Questions are multiple choice, graded by exact match (right or wrong).
 
+## Exam weights (optional)
+
+- Each chapter can carry its share of the exam, in percent (`topics weights` / `topics weight`). Sets without weights work: each chapter then counts in proportion to its topics.
+- A topic's **exam points** are its share of a 50-question exam: its chapter's weight, split across the chapter's topics by their share of its study chunks.
+
 ## Diagnostic modes (one engine)
 
-Both modes call `selection.next_question(state)`. Only the strategy differs.
+Both modes call `Diagnostic.next_question()`. Only the strategy differs.
 
-- **Fixed:** walks through every topic round-robin until each has *k* questions. Guarantees full coverage.
-- **Adaptive:** picks the next topic by weakness and uncertainty (low score, few attempts, or overdue). Zooms in on weak spots faster.
+- **Fixed:** the questions are split across chapters in proportion to their weight; within a chapter, topics take turns, fewest answers first.
+- **Adaptive:** the next topic is the one with the highest **(1 − mastery) × the topic's exam points**, boosted while it has few answers. It stops once every topic has 2 answers, or at the chosen length. (Weighting by the whole chapter's weight let a heavy chapter with many topics take every question.)
+- Within a topic: unseen questions first, preferring a source chunk not yet used in the session, then the least recently answered.
+- **Weakness report:** topics ranked by exam points to gain, exam points × (1 − mastery).
+- **Mock exam (stage 2):** 50 questions split by chapter weight; for CME-1A that's 3, 4, 9, 7, 5, 4, 6, 5, 4, 3.
 
 ## Question generation rules
 
@@ -123,7 +133,7 @@ Both modes call `selection.next_question(state)`. Only the strategy differs.
    - 1b. Synthetic Arabic test PDFs (see Testing), as a small separate step.
 2. **Topic map.** Generate topics from chunks. Let the user rename, merge, or delete topics, since model outlines can be rough.
 3. **Question generation.** Multiple choice only (6 per topic), grounded in one study chunk with a quoted evidence passage, validated, never copied from the user's own practice questions, cached.
-4. **Quiz engine + mastery.** Both diagnostic modes, scoring, mastery updates.
+4. **Quiz engine + mastery.** In two stages. Stage 1: grading, attempts, mastery, the fixed and adaptive diagnostic, and the weakness report, run from the terminal (`python -m mukhtabar.quiz`). Stage 2: practice on weak topics, the mock exam, and spaced repetition.
 5. **Streamlit UI.** Upload, choose study set, take a quiz, see a weak-topics dashboard. RTL support when the language is Arabic.
 6. **Practice loop.** Targeted drills on weak topics, explanations from the source, spaced-repetition scheduling.
 7. **Polish.** README with a screenshot, tests, license, sample study set.
