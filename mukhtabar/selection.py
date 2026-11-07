@@ -1,4 +1,5 @@
-"""What to ask next. The fixed and adaptive diagnostics share one engine
+"""What to ask next: the diagnostics, practice (class Practice) and the mock exam
+(mock_exam). The fixed and adaptive diagnostics share one engine
 (Diagnostic.next_question); only the strategy that picks the next topic differs.
 
 - Fixed: the number of questions per chapter is set up front in proportion to the
@@ -20,8 +21,9 @@ chapter counts in proportion to its topics, so each topic gets an equal share.
 import math
 import random
 from dataclasses import dataclass, field
+from datetime import date
 
-from mukhtabar import db, mastery
+from mukhtabar import db, leitner, mastery
 
 DEFAULT_LENGTH = 30
 MIN_ANSWERS_PER_TOPIC = 2
@@ -114,14 +116,7 @@ class Diagnostic:
         return [q for q in db.questions(self.conn, topic_id) if q["id"] not in self.asked]
 
     def _pick(self, topic_id: int):
-        qs = self._candidates(topic_id)
-        if not qs:
-            return None
-        self.rng.shuffle(qs)
-        qs.sort(key=lambda q: (q["id"] in self.answered,             # unseen first
-                               q["chunk_id"] in self.used_chunks,     # then a source not used yet
-                               self.answered.get(q["id"], "")))       # then least recently answered
-        return qs[0]
+        return pick(self._candidates(topic_id), self.answered, self.used_chunks, self.rng)
 
     def next_question(self):
         """The next question to ask, or None when the diagnostic is over."""
@@ -143,6 +138,112 @@ class Diagnostic:
         self.asked.append(q["id"])
         self.used_chunks.add(q["chunk_id"])
         return q
+
+
+def pick(qs, answered: dict, used_chunks: set, rng, last: dict | None = None):
+    """The best of these questions: unseen first; then, if `last` (question id ->
+    last score) is given, those answered wrong last time; then a source chunk not
+    used yet in the session; then the least recently answered."""
+    if not qs:
+        return None
+    qs = list(qs)
+    rng.shuffle(qs)
+    qs.sort(key=lambda q: (q["id"] in answered,
+                           bool(last is not None and last.get(q["id"], 0) > 0),
+                           q["chunk_id"] in used_chunks,
+                           answered.get(q["id"], "")))
+    return qs[0]
+
+
+@dataclass
+class Practice:
+    """Weakest topics first, by exam points to gain, recomputed after every answer.
+
+    Topics resting in a Leitner box until a later date are left out; if every
+    topic is resting, all of them are used (self.resting is then True). A topic
+    gets at most MAX_PER_TOPIC questions in one session."""
+    conn: object
+    study_set_id: int
+    length: int = 20
+    seed: int | None = None
+    today: date | None = None
+    asked: list[int] = field(default_factory=list)
+    used_chunks: set[int] = field(default_factory=set)
+    resting: bool = False
+
+    MAX_PER_TOPIC = 4
+
+    def __post_init__(self):
+        self.rng = random.Random(self.seed)
+        self.answered = db.answered_question_ids(self.conn, self.study_set_id)
+        self.last = db.last_scores(self.conn, self.study_set_id)
+        self.points = topic_points(self.conn, self.study_set_id)
+        self.per_topic: dict[int, int] = {}
+        reviews = db.reviews(self.conn, self.study_set_id)
+        due = leitner.due_topics(self.conn, self.study_set_id, self.today)
+        topics_ = [t for t in db.topics(self.conn, self.study_set_id) if db.questions(self.conn, t["id"])]
+        self.topics = [t for t in topics_ if t["id"] not in reviews or t["id"] in due]
+        if not self.topics:
+            self.topics, self.resting = topics_, True
+
+    def gain(self, topic_id: int, known) -> float:
+        score, _ = known.get(topic_id, (mastery.PRIOR, 0))
+        return self.points.get(topic_id, 0.0) * (1 - score)
+
+    def next_question(self):
+        if len(self.asked) >= self.length:
+            return None
+        known = mastery.get(self.conn, self.study_set_id)
+        options = [(t["id"], qs) for t in self.topics
+                   if self.per_topic.get(t["id"], 0) < self.MAX_PER_TOPIC
+                   and (qs := [q for q in db.questions(self.conn, t["id"]) if q["id"] not in self.asked])]
+        if not options:
+            return None
+        best = max(self.gain(tid, known) for tid, _ in options)
+        tid, qs = self.rng.choice([o for o in options if abs(self.gain(o[0], known) - best) < 1e-9])
+        q = pick(qs, self.answered, self.used_chunks, self.rng, self.last)
+        self.asked.append(q["id"])
+        self.used_chunks.add(q["chunk_id"])
+        self.per_topic[tid] = self.per_topic.get(tid, 0) + 1
+        return q
+
+
+def mock_exam(conn, study_set_id: int, n: int = EXAM_QUESTIONS, seed: int | None = None) -> list:
+    """n questions split across chapters by exam weight; within a chapter, across
+    topics by their exam points (a topic short of questions passes the rest on).
+    Unseen questions first, then the least recently answered. Shuffled."""
+    rng = random.Random(seed)
+    answered = db.answered_question_ids(conn, study_set_id)
+    points = topic_points(conn, study_set_id)
+    chosen = []
+    for chapter, k in quotas(chapter_weights(conn, study_set_id, by_topics=True), n).items():
+        pools = {t["id"]: list(db.questions(conn, t["id"]))
+                 for t in db.topics(conn, study_set_id) if t["chapter"] == chapter}
+        pools = {tid: qs for tid, qs in pools.items() if qs}
+        counts = {tid: 0 for tid in pools}
+        while k > 0:
+            open_ = {tid: points.get(tid, 0) or 1 for tid in pools if counts[tid] < len(pools[tid])}
+            if not open_:
+                break                                    # the chapter has fewer questions than its share
+            share = quotas(open_, k)
+            given = 0
+            for tid, extra in share.items():
+                extra = min(extra, len(pools[tid]) - counts[tid])
+                counts[tid] += extra
+                given += extra
+            k -= given
+            if not given:
+                break
+        used: set = set()
+        for tid, c in counts.items():
+            qs = pools[tid]
+            for _ in range(c):
+                q = pick(qs, answered, used, rng)
+                qs.remove(q)
+                used.add(q["chunk_id"])
+                chosen.append(q)
+    rng.shuffle(chosen)
+    return chosen
 
 
 def topic_points(conn, study_set_id: int) -> dict[int, float]:

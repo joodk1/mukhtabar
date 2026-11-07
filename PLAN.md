@@ -69,9 +69,10 @@ mukhtabar/
     topics.py            # topic map from chunks
     questions.py         # generate grounded MCQs, with source refs and evidence
     grading.py           # MCQ exact match
-    mastery.py           # per-topic scores + spaced-repetition schedule
-    selection.py         # fixed and adaptive "what to ask next", exam points, weakness report
-    quiz.py              # terminal quiz: diagnostics and the weakness report (until the UI)
+    mastery.py           # per-topic scores
+    leitner.py           # spaced repetition: a Leitner box per topic
+    selection.py         # what to ask next (diagnostic, practice, mock exam), exam points, weakness report
+    quiz.py              # terminal quiz: diagnostic, practice, mock, report, due (until the UI)
     display.py           # Arabic for terminals that don't shape or reorder it
     db.py                # SQLite schema + queries
   tests/                 # run with a mocked LLM, no API calls
@@ -99,7 +100,7 @@ Each study set lives in its own folder/record: its material, chunks, topics, que
 
 - Each topic has a score from 0 to 1, updated after every answer with an exponentially weighted average (α = 0.3, starting from 0.5 = unknown), so recent answers count more.
 - Track attempt count too. A score from 2 answers is less trustworthy than one from 20; below 4 answers it's shown as provisional.
-- Spaced repetition (milestone 4, stage 2): Leitner boxes with review intervals of 1, 3, 7, 14 and 30 days. A topic moves between boxes by its **mastery score**, not by one session's percentage, and only once it has at least 3 answers.
+- Spaced repetition (milestone 4, stage 2): four Leitner boxes with review intervals of 1, 2, 4 and 7 days (short, to fit an exam about two weeks away). A topic moves between boxes by its **mastery score**, not by one session's percentage, and only once it has at least 3 answers. It enters box 1 (box 2 if mastery is already ≥ 0.8). At the end of each session, each topic answered in it moves once: mastery below 0.6 sends it back to box 1; mastery ≥ 0.8 moves it up a box, but only if it was due, so answering early can't skip reviews; otherwise it stays.
 - Scheduling is **per topic, by design**, not per question. The goal is retained understanding of a topic, and questions are drawn fresh (or from cache) each review, so a per-question schedule isn't needed.
 - Questions are multiple choice, graded by exact match (right or wrong).
 
@@ -116,7 +117,8 @@ Both modes call `Diagnostic.next_question()`. Only the strategy differs.
 - **Adaptive:** the next topic is the one with the highest **(1 − mastery) × the topic's exam points**, boosted while it has few answers. It stops once every topic has 2 answers, or at the chosen length. (Weighting by the whole chapter's weight let a heavy chapter with many topics take every question.)
 - Within a topic: unseen questions first, preferring a source chunk not yet used in the session, then the least recently answered.
 - **Weakness report:** topics ranked by exam points to gain, exam points × (1 − mastery).
-- **Mock exam (stage 2):** 50 questions split by chapter weight; for CME-1A that's 3, 4, 9, 7, 5, 4, 6, 5, 4, 3.
+- **Practice (stage 2):** the topic with the most exam points to gain comes next, recomputed after every answer; at most 4 questions per topic per session. Topics resting in a Leitner box until a later date are left out (if all are resting, all are used). Within a topic: unseen questions first, then those answered wrong last time, then the least recently answered.
+- **Mock exam (stage 2):** 50 questions split by chapter weight (for CME-1A: 3, 4, 9, 7, 5, 4, 6, 5, 4, 3); within a chapter, split across topics by exam points; unseen questions first; shuffled. No feedback until the end, then the score per chapter and the wrong answers with their source. Optional time limit; unanswered questions count as wrong.
 
 ## Question generation rules
 

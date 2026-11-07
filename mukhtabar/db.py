@@ -156,6 +156,15 @@ MIGRATIONS = [
         updated_at TEXT NOT NULL
     );
     """,
+    # 9: Leitner boxes for spaced repetition, one per topic
+    """
+    CREATE TABLE reviews (
+        topic_id   INTEGER PRIMARY KEY REFERENCES topics(id) ON DELETE CASCADE,
+        box        INTEGER NOT NULL,             -- 1-4
+        due        TEXT NOT NULL,                -- local date, YYYY-MM-DD
+        updated_at TEXT NOT NULL
+    );
+    """,
 ]
 
 
@@ -512,3 +521,27 @@ def set_questions(conn: sqlite3.Connection, study_set_id: int) -> list[sqlite3.R
         """SELECT q.*, t.chapter, t.title AS topic_title FROM questions q JOIN topics t ON t.id = q.topic_id
            WHERE t.study_set_id = ? ORDER BY t.position, q.id""", (study_set_id,)
     ).fetchall()
+
+
+def last_scores(conn: sqlite3.Connection, study_set_id: int) -> dict[int, float]:
+    """Question id -> the score of its most recent answer."""
+    return {r[0]: r[1] for r in conn.execute(
+        """SELECT a.question_id, a.score FROM attempts a JOIN questions q ON q.id = a.question_id
+           JOIN topics t ON t.id = q.topic_id WHERE t.study_set_id = ?
+           ORDER BY a.answered_at, a.id""", (study_set_id,))}
+
+
+def session_topics(conn: sqlite3.Connection, session_id: int) -> list[int]:
+    return [r[0] for r in conn.execute(
+        "SELECT DISTINCT q.topic_id FROM attempts a JOIN questions q ON q.id = a.question_id WHERE a.session_id = ?",
+        (session_id,))]
+
+
+def reviews(conn: sqlite3.Connection, study_set_id: int) -> dict[int, sqlite3.Row]:
+    return {r["topic_id"]: r for r in conn.execute(
+        "SELECT r.* FROM reviews r JOIN topics t ON t.id = r.topic_id WHERE t.study_set_id = ?", (study_set_id,))}
+
+
+def set_review(conn: sqlite3.Connection, topic_id: int, box: int, due: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO reviews (topic_id, box, due, updated_at) VALUES (?, ?, ?, ?)",
+                 (topic_id, box, due, _now()))

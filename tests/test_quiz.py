@@ -213,3 +213,149 @@ def test_visual_display_keeps_latin_words_numbers_and_brackets_left_to_right(lin
 def test_visual_display_puts_the_first_arabic_word_on_the_right():
     shown = display.visual("الخصم Discount")
     assert shown.startswith("Discount ") and shown.endswith(display.shape("الخصم")[0])
+
+
+# --- Stage 2: Leitner boxes, practice and the mock exam --------------------------
+
+from datetime import date, timedelta
+
+from mukhtabar import leitner
+
+TODAY = date(2026, 11, 7)
+
+
+def day(n):
+    return (TODAY + timedelta(days=n)).isoformat()
+
+
+def test_leitner_intervals_are_short():
+    assert leitner.INTERVALS == {1: 1, 2: 2, 3: 4, 4: 7}
+
+
+@pytest.mark.parametrize("box, due, score, expected", [
+    (None, None, 0.70, (1, day(1))),          # enters box 1 ...
+    (None, None, 0.85, (2, day(2))),          # ... or box 2 when already strong
+    (2, day(0), 0.85, (3, day(4))),           # due and strong: up one box
+    (4, day(-1), 0.95, (4, day(7))),          # the top box stays the top box
+    (2, day(1), 0.95, (2, day(1))),           # not due yet: no promotion, date kept
+    (3, day(3), 0.40, (1, day(1))),           # weak: back to box 1, due or not
+    (3, day(0), 0.70, (3, day(4))),           # due, middling: same box, next date
+])
+def test_leitner_moves_by_mastery(box, due, score, expected):
+    assert leitner.move(box, due, score, TODAY) == expected
+
+
+def test_leitner_needs_three_answers(conn):
+    s = sid(conn)
+    a, b = db.topics(conn, s)[0], db.topics(conn, s)[1]
+    for q in db.questions(conn, a["id"])[:2]:
+        answer(conn, dict(q), True)
+    for q in db.questions(conn, b["id"])[:3]:
+        answer(conn, dict(q), True)
+    with conn:
+        moves = leitner.update(conn, s, [a["id"], b["id"]], TODAY)
+    assert moves == [(b["id"], None, 2)]                 # three right: mastery 0.83, straight to box 2
+    assert db.reviews(conn, s)[b["id"]]["due"] == day(2)
+
+
+def test_pick_prefers_unseen_then_previously_wrong_then_the_rest(conn):
+    import random
+    qs = [dict(q) for q in db.questions(conn, db.topics(conn, sid(conn))[0]["id"])]
+    answered = {qs[0]["id"]: "2026-11-01", qs[1]["id"]: "2026-11-02"}
+    last = {qs[0]["id"]: 0.0, qs[1]["id"]: 1.0}           # q0 wrong last time, q1 right
+    order = []
+    pool = list(qs)
+    while pool:
+        q = selection.pick(pool, answered, set(), random.Random(1), last)
+        order.append(q["id"])
+        pool.remove(q)
+    assert set(order[:2]) == {qs[2]["id"], qs[3]["id"]} and order[2:] == [qs[0]["id"], qs[1]["id"]]
+
+
+def test_practice_starts_with_the_most_points_to_gain(conn):
+    set_weights(conn)
+    s = sid(conn)
+    p = selection.Practice(conn, s, 5, seed=1, today=TODAY)
+    first = p.next_question()
+    # Chapter ج is a single topic worth 10 points; the others are worth 8.3 and 7.5.
+    assert conn.execute("SELECT chapter FROM topics WHERE id = ?", (first["topic_id"],)).fetchone()[0] == "الفصل ج"
+
+
+def test_practice_prefers_the_weaker_topic_and_caps_each_topic(conn):
+    set_weights(conn)
+    s = sid(conn)
+    strong, weak = db.topics(conn, s)[0], db.topics(conn, s)[1]   # same points
+    answer(conn, dict(db.questions(conn, strong["id"])[0]), True)
+    answer(conn, dict(db.questions(conn, weak["id"])[0]), False)
+    p = selection.Practice(conn, s, 20, seed=1, today=TODAY)
+    known = mastery.get(conn, s)
+    assert p.gain(weak["id"], known) > p.gain(strong["id"], known)
+    asked = list(iter(p.next_question, None))
+    per_topic = {}
+    for q in asked:
+        per_topic[q["topic_id"]] = per_topic.get(q["topic_id"], 0) + 1
+    assert max(per_topic.values()) <= selection.Practice.MAX_PER_TOPIC
+    assert len({q["id"] for q in asked}) == len(asked)
+
+
+def test_practice_leaves_out_topics_resting_in_a_box(conn):
+    s = sid(conn)
+    topics = db.topics(conn, s)
+    with conn:
+        db.set_review(conn, topics[0]["id"], 2, day(2))     # resting
+        db.set_review(conn, topics[1]["id"], 1, day(0))     # due today
+    p = selection.Practice(conn, s, 10, seed=1, today=TODAY)
+    ids = {t["id"] for t in p.topics}
+    assert topics[0]["id"] not in ids and topics[1]["id"] in ids and not p.resting
+    with conn:
+        for t in topics:
+            db.set_review(conn, t["id"], 3, day(4))
+    assert selection.Practice(conn, s, 10, seed=1, today=TODAY).resting
+
+
+def test_mock_exam_follows_chapter_weights_and_spreads_topics(conn):
+    set_weights(conn)
+    s = sid(conn)
+    qs = selection.mock_exam(conn, s, 10, seed=1)
+    chapter = {r["id"]: r["chapter"] for r in db.set_questions(conn, s)}
+    assert [sum(chapter[q["id"]] == c for q in qs) for c in WEIGHTS] == [5, 3, 2]
+    assert len({q["id"] for q in qs}) == 10
+    in_a = [q["topic_id"] for q in qs if chapter[q["id"]] == "الفصل أ"]
+    assert sorted(in_a.count(t) for t in set(in_a)) == [1, 2, 2]
+
+
+def test_mock_exam_prefers_unseen_questions(conn):
+    set_weights(conn)
+    s = sid(conn)
+    first = selection.mock_exam(conn, s, 10, seed=1)
+    for q in first:
+        answer(conn, dict(q), True)
+    second = selection.mock_exam(conn, s, 10, seed=1)
+    assert not {q["id"] for q in first} & {q["id"] for q in second}
+
+
+def test_mock_with_a_timer_stops_and_scores_per_chapter(conn, capsys):
+    set_weights(conn)
+    s = sid(conn)
+    ticks = iter(range(0, 10_000, 30))                      # every clock reading is 30 s later
+    replies = iter(["1"] * 50)
+    result = quiz.run_mock(conn, s, minutes=2, read=lambda _: next(replies), seed=1,
+                           clock=lambda: next(ticks))
+    out = capsys.readouterr().out
+    assert "Time is up." in out and 0 < result["answered"] < 50
+    assert "counted wrong" in out and "min left" in out
+    assert "✓" not in out                                     # no feedback during the mock
+    per = quiz.mock_scores(conn, s, selection.mock_exam(conn, s, seed=1), result["answers"])
+    assert sum(n for _, n in per.values()) == 24              # all the fixture has: 12 + 8 + 4
+
+
+def test_a_session_moves_topics_into_boxes(conn):
+    s = sid(conn)
+    t = db.topics(conn, s)[0]
+    for q in db.questions(conn, t["id"])[:2]:
+        answer(conn, dict(q), True)
+    nxt = iter([dict(db.questions(conn, t["id"])[2])])
+    q3 = dict(db.questions(conn, t["id"])[2])
+    right_key = str(int(q3["answer"]) + 1)
+    quiz.run_session(conn, s, "practice", lambda: next(nxt, None), 1, read=lambda _: right_key)
+    assert db.reviews(conn, s)[t["id"]]["box"] == 2
