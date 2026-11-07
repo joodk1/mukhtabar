@@ -71,6 +71,7 @@ mukhtabar/
     grading.py           # MCQ exact match
     mastery.py           # per-topic scores
     leitner.py           # spaced repetition: a Leitner box per topic
+    backup.py            # dated copy of the database
     selection.py         # what to ask next (diagnostic, practice, mock exam), exam points, weakness report
     quiz.py              # terminal quiz: diagnostic, practice, mock, report, due (until the UI)
     display.py           # Arabic for terminals that don't shape or reorder it
@@ -142,10 +143,10 @@ Both modes call `Diagnostic.next_question()`. Only the strategy differs.
 
 ## Public-repo checklist
 
-- [ ] `.gitignore`: API keys / `.env`, the database file, uploaded PDFs, user study sets
-- [ ] `LICENSE` (MIT)
-- [ ] README disclaimer: unofficial study aid, not affiliated with any exam body, AI-generated questions can be wrong, verify against official materials
-- [ ] Keys read from environment or the UI session only, never stored in the repo
+- [x] `.gitignore`: API keys / `.env`, the database file, uploaded PDFs, user study sets
+- [x] `LICENSE` (MIT)
+- [x] README disclaimer: unofficial study aid, not affiliated with any exam body, AI-generated questions can be wrong, verify against official materials
+- [x] Keys read from environment or the UI session only, never stored in the repo
 
 ## Open questions
 
