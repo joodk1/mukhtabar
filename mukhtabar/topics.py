@@ -976,8 +976,12 @@ def _confirm(e: Estimate, yes: bool) -> None:
         return
     if not sys.stdin.isatty():
         raise SystemExit("Not confirmed: re-run with --yes to make these model calls.")
-    if input("Make these model calls? [y/N] ").strip().lower() != "y":
-        raise SystemExit("Cancelled.")
+    try:
+        answer = input("Make these model calls? [y/N] ")
+    except EOFError:  # input closed (some terminals report a closed stdin as a tty)
+        answer = ""
+    if answer.strip().lower() != "y":
+        raise SystemExit("Not confirmed: no model calls made (re-run with --yes to make them).")
 
 
 def _stopped(e: Exception) -> str:
