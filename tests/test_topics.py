@@ -1,4 +1,5 @@
 import json
+import math
 import re
 from types import SimpleNamespace
 
@@ -6,7 +7,7 @@ import pytest
 
 from mukhtabar import db, topics
 from mukhtabar.ingest.pipeline import RechunkRefused, rechunk
-from mukhtabar.llm import Invalid
+from mukhtabar.llm import Invalid, LLMError
 
 CH1, CH2 = "الفصل الأول: الادخار", "الفصل الثاني: الاستثمار"
 BODY = "نص تعليمي عن الموضوع يشرح فكرة واحدة بوضوح ويكفي لكتابة عدة أسئلة عنها."
@@ -55,12 +56,18 @@ def fake_model(drop_first_map_id=False):
             return reply({"topics": [{"title": f"موضوع رقم {g[0]}", "summary": "ملخص قصير للموضوع", "chunk_ids": g}
                                      for g in groups],
                           "non_study": [{"chunk_id": i, "reason": "فهرس"} for i in non_study]})
-        if "Merge them into one final list" in system:
+        if "name the chapter whose subject it belongs to" in system:
             local = re.findall(r'"id": "(b\d+-t\d+)"', user)
-            chapters = re.findall(r"^- (.+)$", system.split("Chapters (from")[1].split("Reply with")[0], re.M)
-            groups = [local[i:i + 2] for i in range(0, len(local), 2)]
-            return reply({"topics": [{"title": f"الموضوع النهائي {n}", "summary": "ملخص", "local_topic_ids": g,
-                                      "chapter": chapters[0] if chapters else ""} for n, g in enumerate(groups, 1)]})
+            chapters = re.findall(r"^- (.+)$", system.split("Chapters:")[1], re.M)
+            return reply({"routes": [{"local_topic_id": l, "chapter": chapters[0]} for l in local]})
+        if "Merge them into the final study topics" in system:
+            state["reduce"] = state.get("reduce", 0) + 1
+            local = re.findall(r'"id": "(b\d+-t\d+)"', user)
+            counts = [int(n) for n in re.findall(r"(?:between|exactly) (\d+)(?: and (\d+))?", system)[0] if n]
+            n = max(counts[0], min(counts[-1], math.ceil(len(local) / 2)))
+            groups = [local[i::n] for i in range(n)]
+            return reply({"topics": [{"title": f"الموضوع النهائي {state['reduce']}-{k}", "summary": "ملخص",
+                                      "local_topic_ids": g} for k, g in enumerate(groups, 1)]})
         if "Place each new local topic" in system:
             existing = [int(i) for i in re.findall(r'"id": (\d+)', user.split("New local topics")[0])]
             local = re.findall(r'"id": "(b\d+-t\d+)"', user)
@@ -121,9 +128,11 @@ def test_build_links_every_study_chunk_once_and_excludes_non_study(conn):
     assert len(linked) + len(excluded) == len(chunks)
     assert len({r[0] for r in linked}) == len(linked)
     assert len(excluded) == 1 and db.unassigned_chunks(conn, sid) == []
-    assert all(t["chapter"] == CH1 for t in db.topics(conn, sid))
-    calls = conn.execute("SELECT purpose, ok FROM llm_calls").fetchall()
-    assert [c[0] for c in calls].count("topics.reduce") == 1 and all(c[1] for c in calls)
+    # Book topics keep their chapter; the summary (no running titles) is routed to one.
+    assert {t["chapter"] for t in db.topics(conn, sid)} <= {CH1, CH2}
+    calls = [c[0] for c in conn.execute("SELECT purpose, ok FROM llm_calls").fetchall()]
+    assert calls.count("topics.route") == 1
+    assert calls.count("topics.reduce") <= topics.planned_calls(chunks, topics.set_hints(conn, sid)) - 1
 
 
 def test_one_primary_topic_per_chunk_is_enforced_by_the_database(conn):
@@ -265,7 +274,8 @@ def test_interrupted_build_resumes_without_repeating_finished_batches(conn):
     topics.build(conn, "Set A", "fake", chunks, completion=counting, batch_chars=1_000)
     assert len(resumed) == len(batches) - 1  # the finished first batch wasn't asked again
     assert db.topics(conn, sid)
-    assert conn.execute("SELECT COUNT(*) FROM llm_cache").fetchone()[0] == 0  # cleared after success
+    # Kept after success, so a rebuild only reruns routing and merging.
+    assert conn.execute("SELECT COUNT(*) FROM llm_cache").fetchone()[0] == len(batches)
 
 
 def test_estimate_counts_only_unfinished_batches(conn):
@@ -275,3 +285,96 @@ def test_estimate_counts_only_unfinished_batches(conn):
     resumed = topics.estimate("gemini/gemini-2.5-flash", batches, "ar", token_counter=len, saved=1)
     assert resumed.calls == full.calls - 1 and resumed.input_tokens < full.input_tokens
     assert "Resuming: 1 of" in topics.describe(resumed)
+
+
+def purposes(conn):
+    return [r[0] for r in conn.execute("SELECT purpose FROM llm_calls ORDER BY id")]
+
+
+def test_rebuild_reuses_saved_map_replies_and_reruns_only_the_merge(conn):
+    sid = set_id(conn)
+    chunks = topics.select_chunks(conn, sid)
+    topics.build(conn, "Set A", "fake", chunks, completion=fake_model())
+    first = len(purposes(conn))
+    topics.build(conn, "Set A", "fake", chunks, force=True, completion=fake_model())
+    again = purposes(conn)[first:]
+    assert "topics.map" not in again and again  # only routing / merging ran
+    with conn:
+        db.cache_clear(conn, sid)
+    topics.build(conn, "Set A", "fake", chunks, force=True, completion=fake_model())
+    assert "topics.map" in purposes(conn)[first + len(again):]
+
+
+def local_topic(i, n_chunks, chapter="ch", title=None):
+    return topics.LocalTopic(f"b1-t{i}", title or f"موضوع {i}", "", list(range(i * 100, i * 100 + n_chunks)),
+                             "book.pdf", "1-1", chapter)
+
+
+def test_each_chapter_gets_a_floor_and_a_cap():
+    # 90 chunks in 12 local topics: floor 90/18 = 5, cap max(6, 5) = 6.
+    groups = topics.plan_groups([local_topic(i, 9 if i < 6 else 6) for i in range(12)], ["ch"], True)
+    assert [(g.chapter, g.floor, g.cap) for g in groups] == [("ch", 5, 6)]
+    # A chapter with more material than the usual cap allows raises the cap to its floor.
+    big = topics.plan_groups([local_topic(i, 15) for i in range(10)], ["ch"], True)[0]
+    assert (big.floor, big.cap) == (9, 9)
+
+
+def test_floor_never_exceeds_the_local_topics_and_caps_fit_the_global_limit():
+    small = topics.plan_groups([local_topic(0, 60), local_topic(1, 60)], ["ch"], True)[0]
+    assert (small.floor, small.cap) == (2, 2)
+    chapters = [f"ch{c}" for c in range(15)]
+    many = [local_topic(c * 10 + i, 3, chapters[c]) for c in range(15) for i in range(10)]
+    groups = topics.plan_groups(many, chapters, True)
+    assert sum(g.cap for g in groups) <= topics.MAX_TOPICS
+    assert all(g.cap >= g.floor for g in groups)
+
+
+def test_same_title_local_topics_are_merged_before_the_merge_call():
+    groups = topics.plan_groups([local_topic(0, 3, title="أ"), local_topic(1, 4, title="أ"),
+                                 local_topic(2, 2, title="ب")], ["ch"], True)
+    assert [len(t.chunk_ids) for t in groups[0].local] == [7, 2]
+
+
+def test_merge_reply_with_too_few_topics_is_rejected():
+    local = [local_topic(i, 9) for i in range(6)]
+    with pytest.raises(Invalid, match="too few"):
+        topics.validate_reduce({"topics": [{"title": "كل شيء", "local_topic_ids": [t.id for t in local]}]},
+                               local, floor=3, cap=6, language="ar")
+
+
+def test_review_questions_and_glossary_entries_cannot_be_excluded(conn):
+    assert topics.protected_kind("7 ما المقصود بالتضخم؟\nمرجع الإجابة: القسم 1-5") == "questions"
+    assert topics.protected_kind("ما الصحيح؟\nأ. الأول\nب. الثاني") == "questions"
+    assert topics.protected_kind("الجمعية العمومية السنوية Annual General Meeting AGM\n"
+                                 "نظام الشركة الأساسي Articles of Association") == "glossary"
+    assert topics.protected_kind("فهرس المحتويات\nمسرد المصطلحات 199\nأسئلة متعددة الخيارات 207") is None
+    with conn:
+        db.replace_chunks(conn, set_id(conn), db.documents(conn, set_id(conn))[1]["id"],
+                          [SimpleNamespace(text=BODY, page=1, page_end=1, position=0),
+                           SimpleNamespace(text="3 ما الفرق بين المفهومين؟\nمرجع الإجابة: القسم 2-1",
+                                           page=2, page_end=2, position=1)])
+    batch = topics.make_batches([c for c in topics.select_chunks(conn, set_id(conn)) if c["filename"] == "summary.pdf"],
+                                [], budget=10_000)[0]
+    body, questions = (c["id"] for c in batch.chunks)
+    with pytest.raises(Invalid, match="study material"):
+        topics.validate_map({"topics": [{"title": "موضوع", "chunk_ids": [body]}],
+                             "non_study": [{"chunk_id": questions}]}, batch, "ar")
+
+
+def test_include_and_exclude_are_kept_across_rebuilds(conn):
+    sid = set_id(conn)
+    chunks = topics.select_chunks(conn, sid)
+    topics.build(conn, "Set A", "fake", chunks, completion=fake_model())
+    toc = conn.execute("SELECT id FROM chunks WHERE excluded = 1").fetchone()[0]
+    some = db.topic_chunk_rows(conn, db.topics(conn, sid)[0]["id"])[0]["id"]
+    with conn:
+        db.set_user_choice(conn, toc, "include")
+        db.set_user_choice(conn, some, "exclude", "not needed")
+    assert db.get_chunk(conn, toc)["excluded"] == 0 and db.get_chunk(conn, some)["excluded"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM topic_chunks WHERE chunk_id = ?", (some,)).fetchone()[0] == 0
+    # A rebuild must not exclude the included chunk again (this fake keeps trying,
+    # so every attempt is rejected), nor bring back the excluded one.
+    with pytest.raises(LLMError, match="marked as study material"):
+        topics.build(conn, "Set A", "fake", topics.select_chunks(conn, sid), force=True, completion=fake_model())
+    assert some not in {c["id"] for c in topics.select_chunks(conn, sid)}
+    assert db.get_chunk(conn, some)["user_choice"] == "exclude"

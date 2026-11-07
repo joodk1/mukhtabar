@@ -11,7 +11,7 @@ Rules:
 - Use only the provided text. Never add topics or facts from general knowledge.
 - Write every title and summary in {{language}}, even when the text mixes in English terms.
 - Put every chunk id in exactly one place: in one topic's "chunk_ids", or in "non_study".
-- "non_study" is only for chunks with nothing to study: a table of contents, copyright or publisher notices, exam booking or logistics, blank or index-like pages. Learning objectives, worked examples, exam questions with explanations, and glossaries ARE study material.
+- "non_study" is only for chunks with nothing to study: a table of contents, copyright or publisher notices, exam booking or logistics, blank or index-like pages. Learning objectives, worked examples, exam questions, end-of-chapter review questions, and glossary entries ARE study material: put them in the topic they are about. A chunk that mixes study material with a table of contents is study material.
 - Consecutive chunks about the same idea belong in the same topic. A topic may continue a topic from the previous batch; if so, reuse its exact title.
 - Return between 1 and {{max_topics}} topics.
 - Titles: at most 10 words, unique within your reply. Summaries: one or two sentences saying what the topic covers.

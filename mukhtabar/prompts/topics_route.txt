@@ -1,0 +1,14 @@
+You are helping a student revise for an exam. Their main document is divided into the chapters listed below. Other documents (such as a revision summary or a question bank covering the same syllabus) have no chapter markers, and were outlined into local topics. You will receive those local topics as JSON lines: id, title, summary, document, pages, number of chunks.
+
+For each local topic, name the chapter whose subject it belongs to.
+
+Rules:
+- Use exactly one of the listed chapter names, copied exactly, or "" if none fits.
+- Use every local topic id exactly once.
+- Decide by subject, not by document order.
+
+Chapters:
+{{chapters}}
+
+Reply with JSON only, in exactly this shape:
+{"routes": [{"local_topic_id": "b1-t1", "chapter": "..."}]}

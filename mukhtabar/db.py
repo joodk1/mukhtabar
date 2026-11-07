@@ -96,6 +96,10 @@ MIGRATIONS = [
         created_at   TEXT NOT NULL
     );
     """,
+    # 4: the user's own include/exclude decisions, kept across rebuilds
+    """
+    ALTER TABLE chunks ADD COLUMN user_choice TEXT;  -- NULL, 'include' or 'exclude'
+    """,
 ]
 
 
@@ -261,9 +265,29 @@ def set_excluded(conn: sqlite3.Connection, chunk_id: int, reason: str | None) ->
 
 
 def clear_topic_map(conn: sqlite3.Connection, study_set_id: int) -> None:
-    """Delete a set's topics (links go with them) and the model's exclusions."""
+    """Delete a set's topics (links go with them) and the model's exclusions.
+    The user's own include/exclude choices are kept."""
     conn.execute("DELETE FROM topics WHERE study_set_id = ?", (study_set_id,))
-    conn.execute("UPDATE chunks SET excluded = 0, excluded_reason = NULL WHERE study_set_id = ?", (study_set_id,))
+    conn.execute("""UPDATE chunks SET excluded = 0, excluded_reason = NULL
+                    WHERE study_set_id = ? AND user_choice IS NOT 'exclude'""", (study_set_id,))
+
+
+def set_user_choice(conn: sqlite3.Connection, chunk_id: int, choice: str, reason: str | None = None) -> None:
+    """'include': study material, never excluded again. 'exclude': skipped by builds.
+    Excluding also removes the chunk's topic links."""
+    if choice == "include":
+        conn.execute("UPDATE chunks SET user_choice = 'include', excluded = 0, excluded_reason = NULL WHERE id = ?",
+                     (chunk_id,))
+    elif choice == "exclude":
+        conn.execute("DELETE FROM topic_chunks WHERE chunk_id = ?", (chunk_id,))
+        conn.execute("UPDATE chunks SET user_choice = 'exclude', excluded = 1, excluded_reason = ? WHERE id = ?",
+                     (reason or "excluded by you", chunk_id))
+    else:
+        raise ValueError(choice)
+
+
+def get_chunk(conn: sqlite3.Connection, chunk_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM chunks WHERE id = ?", (chunk_id,)).fetchone()
 
 
 def linked_chunk_count(conn: sqlite3.Connection, document_id: int) -> tuple[int, int]:

@@ -10,6 +10,9 @@
     python -m mukhtabar.topics merge    KEEP_ID OTHER_ID [OTHER_ID ...]
     python -m mukhtabar.topics delete   TOPIC_ID
     python -m mukhtabar.topics calls    --set NAME
+    python -m mukhtabar.topics include  CHUNK_ID [CHUNK_ID ...]
+    python -m mukhtabar.topics exclude  CHUNK_ID [CHUNK_ID ...] [--reason "..."]
+    python -m mukhtabar.topics clear-cache --set NAME
 
 Model calls happen only in build and assign, and only after the estimate is
 shown and confirmed (interactively, or with --yes).
@@ -40,6 +43,7 @@ MAP_MAX_TOPICS = 12         # per map batch
 TOPICS_PER_CHAPTER = 6      # cap with chapter hints
 OUTSIDE_CHAPTERS = 5        # extra topics allowed for material outside any chapter
 CHUNKS_PER_TOPIC = 15       # cap without hints: largest document's chunks / this
+FLOOR_CHUNKS_PER_TOPIC = 18 # floor per chapter: at least one topic per this many chunks
 MAX_TOPICS = 60
 TITLE_WORDS = 12            # the prompt asks for 10; a little slack avoids needless retries
 MIN_HINT_PAGES = 3          # a running title must open this many pages...
@@ -50,6 +54,23 @@ MIN_LANGUAGE_SHARE = 0.5    # share of letters in the set's script, for titles a
 
 ARABIC_LETTER = re.compile(r"[ء-يٱ-ۓ]")
 LATIN_LETTER = re.compile(r"[A-Za-z]")
+
+# Study material that must never be excluded, recognised from the text itself:
+# review questions point to where the answer is ("مرجع الإجابة"), MCQs have
+# option lines, and glossary entries pair a term with its English name.
+ANSWER_REF = re.compile(r"مرجع الإجابة|answer reference", re.I)
+OPTION_LINE = re.compile(r"^(?:[أبجد]|[A-D])[ .)\-]\s*\S", re.M)
+GLOSSARY_LINE = re.compile(r"^[ء-ي][ء-ي\s/()\-]{2,50}\s[A-Z][A-Za-z'’\- ]{2,60}(?:\s[A-Z]{2,6})?$", re.M)
+
+
+def protected_kind(text: str) -> str | None:
+    """"questions" or "glossary" if the chunk holds material that's always study
+    material, else None."""
+    if ANSWER_REF.search(text) or len(OPTION_LINE.findall(text)) >= 2:
+        return "questions"
+    if len(GLOSSARY_LINE.findall(text)) >= 2:
+        return "glossary"
+    return None
 
 
 # --- Chapter hints ---------------------------------------------------------
@@ -128,8 +149,9 @@ def select_chunks(conn, study_set_id: int, only: list[tuple[str, int, int]] | No
                   chapter: int | None = None) -> list[sqlite3.Row]:
     """Chunks of a set for a build, optionally limited to page ranges and/or one
     chapter (1-based, as listed by `hints`). A chunk is in a range if it starts in
-    it. Previously excluded chunks are included: a build decides afresh."""
-    rows = db.study_chunks(conn, study_set_id)
+    it. The model's earlier exclusions are reconsidered (a build decides afresh);
+    chunks you excluded yourself are left out."""
+    rows = [c for c in db.study_chunks(conn, study_set_id) if c["user_choice"] != "exclude"]
     if only is None and chapter is None:
         return rows
     ranges = list(only or [])
@@ -226,6 +248,7 @@ class LocalTopic:
     chunk_ids: list[int]
     document: str
     pages: str
+    chapter: str | None = None
 
 
 @dataclass
@@ -269,54 +292,19 @@ def validate_map(obj, batch: Batch, language: str) -> MapResult:
             raise Invalid(f"non_study chunk id {cid!r} is not one of this batch's chunks")
         if cid in seen:
             raise Invalid(f"chunk {cid} is both in a topic and in non_study")
+        if expected[cid]["user_choice"] == "include":
+            raise Invalid(f"chunk {cid} is marked as study material by the student; put it in a topic")
+        kind = protected_kind(expected[cid]["text"])
+        if kind:
+            what = "review or exam questions" if kind == "questions" else "glossary entries"
+            raise Invalid(f"chunk {cid} contains {what}, which are study material; put it in a topic, "
+                          "not in non_study")
         seen[cid] = "non_study"
         non_study[cid] = str(n.get("reason") or "not study material")[:200]
     missing = sorted(set(expected) - set(seen))
     if missing:
         raise Invalid(f"these chunk ids are missing: {missing}; put each in one topic or in non_study")
     return MapResult(topics, non_study)
-
-
-@dataclass
-class FinalTopic:
-    title: str
-    summary: str
-    chapter: str | None
-    local_ids: list[str]
-
-
-def validate_reduce(obj, local: list[LocalTopic], chapters: list[str], cap: int, language: str) -> list[FinalTopic]:
-    if not isinstance(obj, dict) or not isinstance(obj.get("topics"), list) or not obj["topics"]:
-        raise Invalid('expected {"topics": [...]} with at least one topic')
-    if len(obj["topics"]) > cap:
-        raise Invalid(f"{len(obj['topics'])} topics is over the limit of {cap}; merge the closest topics")
-    known = {t.id for t in local}
-    used: dict[str, str] = {}
-    out, titles = [], set()
-    for t in obj["topics"]:
-        if not isinstance(t, dict):
-            raise Invalid("each topic must be an object")
-        title = _check_title(t.get("title"), language)
-        if title in titles:
-            raise Invalid(f"duplicate title {title!r}")
-        titles.add(title)
-        chapter = (t.get("chapter") or "").strip() or None
-        if chapter and chapters and chapter not in chapters:
-            raise Invalid(f"chapter {chapter!r} is not one of the listed chapters")
-        ids = t.get("local_topic_ids")
-        if not isinstance(ids, list) or not ids:
-            raise Invalid(f"topic {title!r} has no local_topic_ids")
-        for lid in ids:
-            if lid not in known:
-                raise Invalid(f"unknown local topic id {lid!r}")
-            if lid in used:
-                raise Invalid(f"local topic {lid} is used twice ({used[lid]!r} and {title!r})")
-            used[lid] = title
-        out.append(FinalTopic(title, _check_summary(t.get("summary"), language), chapter, list(ids)))
-    missing = sorted(known - set(used))
-    if missing:
-        raise Invalid(f"these local topic ids are missing: {missing}")
-    return out
 
 
 @dataclass
@@ -422,11 +410,12 @@ def estimate(model: str, batches: list[Batch], language: str, extra_calls: int =
         msgs = _map_messages(b, language, "")
         inp += sum(token_counter(m["content"]) for m in msgs)
         out += 30 + topics * 70 + len(b.chunks) * 4
-    # Reduce (and assign's placement call): local topic lines in, final topics out.
-    for _ in range(extra_calls):
-        inp += token_counter(_prompt("topics_reduce", language="", chapter_rule="", max_topics=0, chapters="")) \
-            + local_topics * 80
-        out += max(1, local_topics // 2) * 70 + local_topics * 6
+    # Calls after the map (routing, per-chapter merges, or assign's placement): each
+    # local topic line is sent about twice in total, final topics come back.
+    if extra_calls:
+        inp += extra_calls * token_counter(_prompt("topics_reduce", language="", scope="", count_rule="")) \
+            + local_topics * 80 * 2
+        out += max(1, local_topics // 3) * 70 + local_topics * 12
     info = litellm.model_cost.get(model) or litellm.model_cost.get(model.split("/", 1)[-1]) or {}
     thinking = THINKING_ALLOWANCE if info.get("supports_reasoning") else 0
     return Estimate(model, sum(len(b.chunks) for b in batches), len(batches), len(batches) - saved + extra_calls,
@@ -479,9 +468,11 @@ def cached_batches(conn, model: str, batches: list[Batch], language: str) -> int
     return n
 
 
-def _run_map(conn, set_id, batches, language, model, log, completion, extra) -> tuple[list[LocalTopic], dict[int, str]]:
+def _run_map(conn, set_id, batches, language, model, log, completion, extra,
+             hints: list[Hint]) -> tuple[list[LocalTopic], dict[int, str]]:
     """Map every batch. A batch whose exact prompt was answered before (an
-    interrupted run) reuses the saved reply instead of calling the model again."""
+    interrupted or earlier run) reuses the saved reply instead of calling the model
+    again. Each local topic gets the chapter most of its chunks are in."""
     local: list[LocalTopic] = []
     non_study: dict[int, str] = {}
     previous = ""
@@ -502,6 +493,10 @@ def _run_map(conn, set_id, batches, language, model, log, completion, extra) -> 
                                       validate=validate, completion=completion, extra=extra)
             db.cache_put(conn, _cache_key(model, messages), set_id, "topics.map",
                          json.dumps(raw[-1], ensure_ascii=False))
+        rows = {c["id"]: c for c in b.chunks}
+        for t in result.topics:
+            chapters = Counter(chapter_of(rows[c], hints) for c in t.chunk_ids)
+            t.chapter = chapters.most_common(1)[0][0]
         local += result.topics
         non_study.update(result.non_study)
         previous = result.topics[-1].title
@@ -514,10 +509,164 @@ def _local_lines(local: list[LocalTopic]) -> str:
                      for t in local)
 
 
+@dataclass
+class Group:
+    """Local topics merged together: one chapter, or material outside any chapter."""
+    chapter: str | None
+    local: list[LocalTopic]
+    floor: int = 1
+    cap: int = 1
+
+    @property
+    def n_chunks(self) -> int:
+        return sum(len(t.chunk_ids) for t in self.local)
+
+
+def _premerge(local: list[LocalTopic]) -> list[LocalTopic]:
+    """Merge local topics with the same title (a topic continued across batches)."""
+    by_title: dict[str, LocalTopic] = {}
+    out = []
+    for t in local:
+        if t.title in by_title:
+            by_title[t.title].chunk_ids += t.chunk_ids
+        else:
+            by_title[t.title] = LocalTopic(t.id, t.title, t.summary, list(t.chunk_ids), t.document, t.pages, t.chapter)
+            out.append(by_title[t.title])
+    return out
+
+
+def plan_groups(local: list[LocalTopic], chapters: list[str], has_hints: bool) -> list[Group]:
+    """One group per chapter (in chapter order), then material outside any chapter.
+    Each gets a floor of one topic per FLOOR_CHUNKS_PER_TOPIC chunks (never more
+    than its local topics) and a cap of TOPICS_PER_CHAPTER (raised to the floor if
+    needed). Caps are trimmed, never below a floor, so the total stays within
+    MAX_TOPICS."""
+    groups = [Group(c, [t for t in local if t.chapter == c]) for c in chapters]
+    groups.append(Group(None, [t for t in local if t.chapter not in chapters]))
+    groups = [g for g in groups if g.local]
+    for g in groups:
+        g.local = _premerge(g.local)
+        g.floor = min(len(g.local), max(1, math.ceil(g.n_chunks / FLOOR_CHUNKS_PER_TOPIC)))
+        if g.chapter is not None:
+            base = TOPICS_PER_CHAPTER
+        elif has_hints:
+            base = OUTSIDE_CHAPTERS
+        else:
+            base = min(MAX_TOPICS, max(1, math.ceil(g.n_chunks / CHUNKS_PER_TOPIC)))
+        g.cap = min(len(g.local), max(base, g.floor))
+    while sum(g.cap for g in groups) > MAX_TOPICS:
+        slack = [g for g in groups if g.cap > g.floor]
+        if not slack:
+            break
+        max(slack, key=lambda g: g.cap - g.floor).cap -= 1
+    return groups
+
+
+@dataclass
+class FinalTopic:
+    title: str
+    summary: str
+    chapter: str | None
+    local_ids: list[str]
+
+
+def validate_reduce(obj, local: list[LocalTopic], floor: int, cap: int, language: str) -> list[FinalTopic]:
+    if not isinstance(obj, dict) or not isinstance(obj.get("topics"), list) or not obj["topics"]:
+        raise Invalid('expected {"topics": [...]} with at least one topic')
+    n = len(obj["topics"])
+    if n > cap:
+        raise Invalid(f"{n} topics is over the limit of {cap}; merge the closest topics")
+    if n < floor:
+        raise Invalid(f"{n} topics is too few for this much material; return at least {floor}, "
+                      "splitting broad topics into their distinct ideas")
+    known = {t.id for t in local}
+    used: dict[str, str] = {}
+    out, titles = [], set()
+    for t in obj["topics"]:
+        if not isinstance(t, dict):
+            raise Invalid("each topic must be an object")
+        title = _check_title(t.get("title"), language)
+        if title in titles:
+            raise Invalid(f"duplicate title {title!r}")
+        titles.add(title)
+        ids = t.get("local_topic_ids")
+        if not isinstance(ids, list) or not ids:
+            raise Invalid(f"topic {title!r} has no local_topic_ids")
+        for lid in ids:
+            if lid not in known:
+                raise Invalid(f"unknown local topic id {lid!r}")
+            if lid in used:
+                raise Invalid(f"local topic {lid} is used twice ({used[lid]!r} and {title!r})")
+            used[lid] = title
+        out.append(FinalTopic(title, _check_summary(t.get("summary"), language), None, list(ids)))
+    missing = sorted(known - set(used))
+    if missing:
+        raise Invalid(f"these local topic ids are missing: {missing}")
+    return out
+
+
+def validate_route(obj, local: list[LocalTopic], chapters: list[str]) -> dict[str, str | None]:
+    if not isinstance(obj, dict) or not isinstance(obj.get("routes"), list):
+        raise Invalid('expected {"routes": [...]}')
+    known = {t.id for t in local}
+    out: dict[str, str | None] = {}
+    for r in obj["routes"]:
+        lid = r.get("local_topic_id") if isinstance(r, dict) else None
+        if lid not in known:
+            raise Invalid(f"unknown local topic id {lid!r}")
+        if lid in out:
+            raise Invalid(f"local topic {lid} routed twice")
+        chapter = (r.get("chapter") or "").strip() or None
+        if chapter is not None and chapter not in chapters:
+            raise Invalid(f"chapter {chapter!r} is not one of the listed chapters; use one of them or \"\"")
+        out[lid] = chapter
+    missing = sorted(known - set(out))
+    if missing:
+        raise Invalid(f"these local topic ids are missing: {missing}")
+    return out
+
+
+def _route(local, chapters, language, model, log, completion, extra) -> None:
+    """Give chapterless local topics (documents without running titles) a chapter."""
+    loose = [t for t in local if t.chapter is None]
+    if not loose or not chapters:
+        return
+    print(f"  route: {len(loose)} local topics from documents without chapters", flush=True)
+    system = _prompt("topics_route", chapters="\n".join(f"- {c}" for c in chapters))
+    routes, _ = complete_json(
+        [{"role": "system", "content": system}, {"role": "user", "content": _local_lines(loose)}],
+        model=model, purpose="topics.route", log=log, completion=completion, extra=extra,
+        validate=lambda obj: validate_route(obj, loose, chapters))
+    for t in loose:
+        t.chapter = routes[t.id]
+
+
+def _reduce(group: Group, language, model, log, completion, extra) -> list[FinalTopic]:
+    if len(group.local) <= group.floor:
+        # As many local topics as the floor asks for: nothing to merge, no call.
+        return [FinalTopic(t.title, t.summary, group.chapter, [t.id]) for t in group.local]
+    scope = f'the chapter "{group.chapter}"' if group.chapter else "material outside the listed chapters"
+    count = (f"Return between {group.floor} and {group.cap} topics." if group.floor < group.cap
+             else f"Return exactly {group.cap} topics.")
+    system = _prompt("topics_reduce", language=_language_name(language), scope=scope, count_rule=count)
+    print(f"  reduce {group.chapter or '(outside chapters)'}: {len(group.local)} local topics, "
+          f"{group.n_chunks} chunks -> {group.floor}-{group.cap}", flush=True)
+    final, _ = complete_json(
+        [{"role": "system", "content": system}, {"role": "user", "content": _local_lines(group.local)}],
+        model=model, purpose="topics.reduce", log=log, completion=completion, extra=extra,
+        validate=lambda obj: validate_reduce(obj, group.local, group.floor, group.cap, language))
+    for t in final:
+        t.chapter = group.chapter
+    return final
+
+
 def build(conn: sqlite3.Connection, set_name: str, model: str, chunks: list[sqlite3.Row], *,
           force: bool = False, completion: Callable | None = None, extra: dict | None = None,
           batch_chars: int = BATCH_CHARS) -> list[int]:
-    """Build (or with force, rebuild) the topic map from the given chunks. Returns topic ids."""
+    """Build (or with force, rebuild) the topic map from the given chunks. Returns topic ids.
+
+    Map replies are saved and reused: a rebuild with the same chunks and prompts
+    only reruns the routing and per-chapter merge calls (see `clear-cache`)."""
     study_set = _get_set(conn, set_name)
     set_id, language = study_set["id"], study_set["language"]
     if db.topics(conn, set_id) and not force:
@@ -526,37 +675,40 @@ def build(conn: sqlite3.Connection, set_name: str, model: str, chunks: list[sqli
     batches = make_batches(chunks, hints, batch_chars)
     if not batches:
         raise RuntimeError("No chunks selected.")
-    cap = topic_cap(chunks, hints)
 
     def log(record):
         db.log_llm_call(conn, set_id, record)
 
-    local, non_study = _run_map(conn, set_id, batches, language, model, log, completion, extra)
+    local, non_study = _run_map(conn, set_id, batches, language, model, log, completion, extra, hints)
     chapters = list(dict.fromkeys(h.title for h in hints if any(chapter_of(c, [h]) for c in chunks)))
-    system = _prompt(
-        "topics_reduce", language=_language_name(language), max_topics=cap,
-        chapters="\n".join(f"- {c}" for c in chapters) or "(none detected)",
-        chapter_rule=("Set each topic's \"chapter\" to the listed chapter it belongs to, or \"\" if none fits."
-                      if chapters else "Set \"chapter\" to \"\"."))
-    print(f"  reduce: {len(local)} local topics -> at most {cap}", flush=True)
-    final, _ = complete_json(
-        [{"role": "system", "content": system}, {"role": "user", "content": _local_lines(local)}],
-        model=model, purpose="topics.reduce", log=log, completion=completion, extra=extra,
-        validate=lambda obj: validate_reduce(obj, local, chapters, cap, language))
+    _route(local, chapters, language, model, log, completion, extra)
+    groups = plan_groups(local, chapters, bool(hints))
+    final_by_group = [(g, _reduce(g, language, model, log, completion, extra)) for g in groups]
 
-    by_id = {t.id: t for t in local}
     ids = []
     with conn:
         if force:
             db.clear_topic_map(conn, set_id)
         for cid, reason in non_study.items():
             db.set_excluded(conn, cid, reason)
-        for pos, t in enumerate(final):
-            tid = db.add_topic(conn, set_id, t.title, t.summary, t.chapter, pos)
-            db.link_chunks(conn, tid, [c for lid in t.local_ids for c in by_id[lid].chunk_ids])
-            ids.append(tid)
-        db.cache_clear(conn, set_id)  # done: a later rebuild starts fresh
+        pos = 0
+        for g, final in final_by_group:
+            by_id = {t.id: t for t in g.local}
+            for t in final:
+                tid = db.add_topic(conn, set_id, t.title, t.summary, t.chapter, pos)
+                db.link_chunks(conn, tid, [c for lid in t.local_ids for c in by_id[lid].chunk_ids])
+                ids.append(tid)
+                pos += 1
     return ids
+
+
+def planned_calls(chunks: list[sqlite3.Row], hints: list[Hint]) -> int:
+    """Calls after the map: one route call if some chunks have no chapter while
+    others do, plus one merge per chapter and one for material outside chapters."""
+    chapters = {chapter_of(c, hints) for c in chunks}
+    named = {c for c in chapters if c}
+    route = 1 if named and None in chapters else 0
+    return route + len(named) + (1 if None in chapters else 0)
 
 
 def assign(conn: sqlite3.Connection, set_name: str, model: str, *, completion: Callable | None = None,
@@ -577,7 +729,7 @@ def assign(conn: sqlite3.Connection, set_name: str, model: str, *, completion: C
         db.log_llm_call(conn, set_id, record)
 
     local, non_study = _run_map(conn, set_id, make_batches(chunks, hints, batch_chars), language, model, log,
-                                completion, extra)
+                                completion, extra, hints)
     existing_lines = "\n".join(json.dumps({"id": t["id"], "title": t["title"], "summary": t["summary"]},
                                           ensure_ascii=False) for t in db.topics(conn, set_id))
     placements, _ = complete_json(
@@ -602,7 +754,6 @@ def assign(conn: sqlite3.Connection, set_name: str, model: str, *, completion: C
                 tid = new_topics[p.new_title]
             db.link_chunks(conn, tid, by_id[p.local_id].chunk_ids)
             placed += len(by_id[p.local_id].chunk_ids)
-        db.cache_clear(conn, set_id)
     return placed, len(new_topics)
 
 
@@ -694,6 +845,7 @@ def main(argv: list[str] | None = None) -> None:
     with_model(with_set(sub.add_parser("estimate", help="estimate calls, tokens and cost (no model call)")))
     b = with_model(with_set(sub.add_parser("build", help="build the topic map")))
     b.add_argument("--force", action="store_true", help="replace an existing topic map")
+    b.add_argument("--fresh", action="store_true", help="ignore saved map replies and ask the model again")
     a = with_set(sub.add_parser("assign", help="place unassigned chunks into topics"))
     a.add_argument("--model")
     a.add_argument("--batch-chars", type=int, default=BATCH_CHARS)
@@ -714,6 +866,12 @@ def main(argv: list[str] | None = None) -> None:
     dl = sub.add_parser("delete")
     dl.add_argument("topic_id", type=int)
     with_set(sub.add_parser("calls", help="model usage log"))
+    inc = sub.add_parser("include", help="mark chunks as study material (never excluded again)")
+    inc.add_argument("chunk_ids", type=int, nargs="+")
+    exc = sub.add_parser("exclude", help="exclude chunks from topics (kept across rebuilds)")
+    exc.add_argument("chunk_ids", type=int, nargs="+")
+    exc.add_argument("--reason")
+    with_set(sub.add_parser("clear-cache", help="forget saved map replies, so the next build asks the model again"))
 
     args = parser.parse_args(argv)
     conn = db.connect(args.db)
@@ -728,8 +886,13 @@ def main(argv: list[str] | None = None) -> None:
         s = _get_set(conn, args.set)
         model = _model(args)
         chunks = select_chunks(conn, s["id"], parse_only(args.only) if args.only else None, args.chapter)
-        batches = make_batches(chunks, set_hints(conn, s["id"]), args.batch_chars)
-        e = estimate(model, batches, s["language"], saved=cached_batches(conn, model, batches, s["language"]))
+        hints = set_hints(conn, s["id"])
+        batches = make_batches(chunks, hints, args.batch_chars)
+        if args.command == "build" and args.fresh:
+            with conn:
+                db.cache_clear(conn, s["id"])
+        e = estimate(model, batches, s["language"], extra_calls=planned_calls(chunks, hints),
+                     saved=cached_batches(conn, model, batches, s["language"]))
         if args.command == "estimate":
             print(describe(e))
             return
@@ -786,6 +949,23 @@ def main(argv: list[str] | None = None) -> None:
         merge(conn, args.keep_id, args.other_ids)
     elif args.command == "delete":
         print(f"Deleted; {delete(conn, args.topic_id)} chunks are now unassigned.")
+    elif args.command in ("include", "exclude"):
+        with conn:
+            for cid in args.chunk_ids:
+                c = db.get_chunk(conn, cid)
+                if c is None:
+                    raise SystemExit(f"No chunk {cid}")
+                db.set_user_choice(conn, cid, args.command, getattr(args, "reason", None))
+        n = len(args.chunk_ids)
+        if args.command == "include":
+            print(f"Included {n} chunks. They have no topic yet: run `assign` (or rebuild) to place them.")
+        else:
+            print(f"Excluded {n} chunks; their topic links were removed.")
+    elif args.command == "clear-cache":
+        s = _get_set(conn, args.set)
+        with conn:
+            db.cache_clear(conn, s["id"])
+        print("Saved map replies cleared.")
     elif args.command == "calls":
         s = _get_set(conn, args.set)
         rows = conn.execute("SELECT * FROM llm_calls WHERE study_set_id = ? ORDER BY id", (s["id"],)).fetchall()
