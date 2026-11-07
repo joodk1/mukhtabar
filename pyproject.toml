@@ -19,5 +19,8 @@ spike = [
 ]
 dev = ["pytest"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.setuptools.packages.find]
 include = ["mukhtabar*"]

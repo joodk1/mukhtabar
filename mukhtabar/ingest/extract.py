@@ -8,13 +8,22 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple
+
+
+class Line(NamedTuple):
+    text: str
+    top: float
+    bottom: float
 
 
 @dataclass
 class Page:
     text: str
     flags: list[str] = field(default_factory=list)
+    # Only backends that know positions fill these; header/footer removal needs them.
+    lines: list[Line] | None = None
+    height: float | None = None
 
 
 Backend = Callable[[Path], list[Page]]
@@ -41,9 +50,13 @@ def _pdfplumber_rtl(path: Path) -> list[Page]:
     from mukhtabar.ingest.rtl_layout import layout_page, resolve_brackets
 
     with pdfplumber.open(path) as pdf:
-        laid_out = [layout_page(page) for page in pdf.pages]
-    texts = resolve_brackets([text for text, _ in laid_out])
-    return [Page(text, flags) for text, (_, flags) in zip(texts, laid_out)]
+        laid_out = [(*layout_page(page), page.height) for page in pdf.pages]
+    texts = resolve_brackets(["\n".join(t for t, _, _ in lines) for lines, _, _ in laid_out])
+    pages = []
+    for text, (lines, flags, height) in zip(texts, laid_out):
+        resolved = [Line(t, top, bottom) for t, (_, top, bottom) in zip(text.split("\n"), lines)]
+        pages.append(Page(text, flags, resolved, height))
+    return pages
 
 
 @register("pypdf", "BSD-3-Clause")
@@ -103,5 +116,9 @@ def extract_pages(path: str | Path, backend: str = DEFAULT_BACKEND, clean: bool 
     pages = BACKENDS[backend](Path(path))
     if clean:
         for p in pages:
-            p.text = normalize(p.text)
+            if p.lines is not None:
+                p.lines = [Line(normalize(l.text), l.top, l.bottom) for l in p.lines]
+                p.text = "\n".join(l.text for l in p.lines)
+            else:
+                p.text = normalize(p.text)
     return pages

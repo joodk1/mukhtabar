@@ -177,7 +177,11 @@ def _inside(w: dict, bbox) -> bool:
     return x0 <= cx <= x1 and top <= cy <= bottom
 
 
-def _table_text(table, words: list[dict]) -> list[str]:
+def _positioned(words: list[dict]) -> tuple[str, float, float]:
+    return _line_text(words), min(w["top"] for w in words), max(w["bottom"] for w in words)
+
+
+def _table_lines(table, words: list[dict]) -> list[tuple[str, float, float]]:
     """One line per row: each cell's text kept whole, cells right to left."""
     rows = []
     for row in table.rows:
@@ -185,13 +189,13 @@ def _table_text(table, words: list[dict]) -> list[str]:
         texts = [" ".join(_line_text(l) for l in _cluster_lines([w for w in words if _inside(w, c)]))
                  for c in cells]
         if any(texts):
-            rows.append(" | ".join(texts))
+            rows.append((" | ".join(texts), row.bbox[1], row.bbox[3]))
     return rows
 
 
-def layout_page(page) -> tuple[str, list[str]]:
-    """Text of a pdfplumber page in reading order, with bracket placeholders
-    still unresolved (see resolve_brackets), plus any flags.
+def layout_page(page) -> tuple[list[tuple[str, float, float]], list[str]]:
+    """Lines of a pdfplumber page in reading order, as (text, top, bottom), with
+    bracket placeholders still unresolved (see resolve_brackets), plus any flags.
 
     Tables are laid out cell by cell; the text between them is laid out in bands."""
     page = page.filter(lambda o: not (
@@ -199,29 +203,29 @@ def layout_page(page) -> tuple[str, list[str]]:
     ))
     words = page.extract_words(return_chars=True, x_tolerance=1.5)
     tables = sorted(page.find_tables(), key=lambda t: t.bbox[1])
-    out: list[str] = []
+    out: list[tuple[str, float, float]] = []
     flags: list[str] = []
     top = 0.0
     for table in tables + [None]:
         bottom = table.bbox[1] if table else float("inf")
         band = [w for w in words if top <= (w["top"] + w["bottom"]) / 2 < bottom
                 and not any(_inside(w, t.bbox) for t in tables)]
-        text, band_flags = _layout_flow(band, page.width)
-        out += [text] if text else []
+        lines, band_flags = _layout_flow(band, page.width)
+        out += lines
         flags += [f for f in band_flags if f not in flags]
         if table:
-            out += _table_text(table, [w for w in words if _inside(w, table.bbox)])
+            out += _table_lines(table, [w for w in words if _inside(w, table.bbox)])
             top = table.bbox[3]
-    return "\n".join(out), flags
+    return out, flags
 
 
-def _layout_flow(words: list[dict], width: float) -> tuple[str, list[str]]:
+def _layout_flow(words: list[dict], width: float) -> tuple[list[tuple[str, float, float]], list[str]]:
     """Running text outside tables, in one or two columns."""
     lines = _cluster_lines(words)
     gutter = _find_gutter(words, width, len(lines))
     if gutter is None:
         flags = [FLAG_COLUMNS] if _looks_multicolumn(lines) else []
-        return "\n".join(_line_text(l) for l in lines), flags
+        return [_positioned(l) for l in lines], flags
 
     g0, g1 = gutter
     mid = (g0 + g1) / 2
@@ -238,4 +242,4 @@ def _layout_flow(words: list[dict], width: float) -> tuple[str, list[str]]:
             for w in line:
                 (right if (w["x0"] + w["x1"]) / 2 > mid else left).append(w)
     ordered += _cluster_lines(right) + _cluster_lines(left)
-    return "\n".join(_line_text(l) for l in ordered), []
+    return [_positioned(l) for l in ordered], []

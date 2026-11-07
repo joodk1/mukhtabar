@@ -60,7 +60,10 @@ mukhtabar/
     ingest/
       extract.py         # PDF -> per-page text; pluggable backends, default pdfplumber-rtl
       rtl_layout.py      # reading order from glyph positions: RTL lines, columns, tables
-      chunk.py           # text -> chunks
+      headers.py         # conservative running header/footer removal, with a log
+      chunk.py           # text -> paragraphs -> chunks (may cross page breaks)
+      pipeline.py        # extract -> clean -> chunk -> SQLite; language guess; rechunk
+      __main__.py        # CLI: python -m mukhtabar.ingest add|rechunk|removed
     topics.py            # topic map from chunks
     questions.py         # generate MCQ + short-answer, with source refs
     grading.py           # MCQ exact match, short-answer graded by model
@@ -79,8 +82,9 @@ Each study set lives in its own folder/record: its material, chunks, topics, que
 ## Data model (SQLite, sketch)
 
 - `study_sets` — id, name, language, created_at
-- `documents` — id, study_set_id, filename, page_count, added_at
-- `chunks` — id, study_set_id, document_id, page, text, position
+- `documents` — id, study_set_id, filename, sha256, page_count, added_at
+- `pages` — document_id, page, text, flags (extracted text kept so re-chunking doesn't re-extract)
+- `chunks` — id, study_set_id, document_id, page, page_end, text, position (chunks may cross page breaks)
 - `topics` — id, study_set_id, title, summary
 - `topic_chunks` — topic_id, chunk_id
 - `questions` — id, topic_id, chunk_id, type, prompt, options, answer, explanation
@@ -113,7 +117,8 @@ Both modes call `selection.next_question(state)`. Only the strategy differs.
 ## Milestones
 
 0. **Repo setup + extractor spike.** Compare pypdf, pdfplumber, pypdfium2 and PyMuPDF on real Arabic material (each document type separately), raw and with Unicode normalization. Check for reversed or disconnected letters, lost spaces, and scanned pages. Make the extractor pluggable and prefer a permissive license (PyMuPDF is AGPL) unless PyMuPDF is clearly better. Everything after depends on this.
-1. **Ingest + SQLite.** Upload a PDF, extract, chunk, store.
+1. **Ingest + SQLite.** Extract, remove running headers/footers, chunk, store; driven by a command-line tool until the UI exists. Language guessed (Arabic with English terms counts as Arabic), with an override.
+   - 1b. Synthetic Arabic test PDFs (see Testing), as a small separate step.
 2. **Topic map.** Generate topics from chunks. Let the user rename, merge, or delete topics, since model outlines can be rough.
 3. **Question generation.** MCQ and short-answer, grounded, validated, cached.
 4. **Quiz engine + mastery.** Both diagnostic modes, scoring, mastery updates.
@@ -132,5 +137,8 @@ Both modes call `selection.next_question(state)`. Only the strategy differs.
 
 - Chunk size that works best for Arabic text
 - How many questions to generate per call vs. cost
-- How to auto-detect language, or just ask the user when creating a study set
 - Whether weak-topic explanations should be a chat or a one-shot card
+
+## Ideas for later (not planned)
+
+- **Question-bank import:** if a user's own material is already a question bank (questions, options, answer, explanation), import those as ready-made questions instead of generating new ones. Users' own files only; never bundle any question bank with the repo.
