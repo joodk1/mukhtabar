@@ -119,13 +119,14 @@ def test_practice_chunks_are_sent_as_style_examples_only(conn):
 
 
 @pytest.mark.parametrize("mutate, message", [
-    (lambda o, u: o["questions"][0].update(evidence="جملة لا توجد في أي نص من النصوص المرسلة إطلاقا"), "word for word"),
+    (lambda o, u: o["questions"][0].update(evidence="جملة لا توجد في أي نص من النصوص المرسلة إطلاقا"),
+     'you gave: "جملة لا توجد في أي نص من النصوص المرسلة إطلاقا"'),   # the quote is logged with the rejection
     (lambda o, u: o["questions"][0].update(chunk_id=int(re.findall(r'<chunk id="(\d+)"[^>]*kind="practice"', u)[0])),
      "style examples only"),
     (lambda o, u: o["questions"][0].update(prompt="ما الفرق بين السند الحكومي وسند الشركة من حيث مستوى المخاطرة المتوقعة للمستثمر؟"),
      "copies an existing practice question"),
     (lambda o, u: o["questions"].pop(), "exactly 3"),
-    (lambda o, u: o["questions"][0].update(evidence="س" * 250), "at most about 200 characters"),
+    (lambda o, u: o["questions"][0].update(evidence="س" * 450), "at most about 400 characters"),
     (lambda o, u: o["questions"][0].update(options=["أ", "أ", "ب", "ج"]), "4 different"),
     (lambda o, u: o["questions"][1].update(prompt=o["questions"][0]["prompt"]), "repeats"),
 ])
@@ -194,3 +195,12 @@ def test_exhausted_quota_stops_the_whole_run(conn, two_topics):
         raise RuntimeError("429 RESOURCE_EXHAUSTED: quota exceeded, limit per day")
     with pytest.raises(QuotaExhausted):
         questions.generate(conn, "Set Q", "fake", [first, second], completion=quota)
+
+
+def test_evidence_of_a_full_long_sentence_is_accepted(conn):
+    long_sentence = ("يحصل حامل السند على فائدة دورية تسمى القسيمة " * 7).strip()
+    assert 300 < len(long_sentence) <= questions.MAX_EVIDENCE_CHARS
+    study = [{"id": 1, "text": f"مقدمة قصيرة. {long_sentence}. خاتمة."}]
+    q = {"prompt": "ما الذي يحصل عليه حامل السند بشكل دوري حتى الاستحقاق؟", "options": ["قسيمة", "سهم", "عقد", "خيار"],
+         "answer_index": 0, "explanation": "لأن النص يذكر ذلك.", "chunk_id": 1, "evidence": long_sentence}
+    assert questions.validate_questions({"questions": [q]}, study, 1, "ar", set(), [])[0]["evidence"] == long_sentence

@@ -26,7 +26,7 @@ from mukhtabar.llm import Invalid, LLMError, QuotaExhausted, complete_json
 QUESTIONS_PER_TOPIC = 6
 QUESTIONS_PER_CALL = 3       # short replies are less likely to be cut off
 MAX_OUTPUT_TOKENS = 8192     # explicit and generous, so the provider's default never truncates
-MAX_EVIDENCE_CHARS = 220     # "about 200 characters": one sentence, keeps replies short
+MAX_EVIDENCE_CHARS = 420     # "about 400 characters": a full Arabic textbook sentence fits
 SOURCE_CHARS = 20_000        # study text sent per topic
 MAX_PRACTICE_CHUNKS = 3      # practice-question chunks sent as style examples
 MIN_EVIDENCE_CHARS = 20
@@ -106,9 +106,11 @@ def validate_questions(obj, study: list, n: int, language: str, practice_shingle
                           "(practice chunks are style examples only)")
         evidence = (q.get("evidence") or "").strip()
         if len(evidence) > MAX_EVIDENCE_CHARS:
-            raise Invalid(f"question {i}: \"evidence\" must be one sentence of at most about 200 characters")
+            raise Invalid(f"question {i}: \"evidence\" must be one sentence of at most about 400 characters")
         if len(canon(evidence)) < MIN_EVIDENCE_CHARS or canon(evidence) not in texts[cid]:
-            raise Invalid(f"question {i}: \"evidence\" must be copied word for word from chunk {cid}")
+            # The quote is included so the rejection log shows exactly what didn't match.
+            raise Invalid(f"question {i}: \"evidence\" must be copied word for word from chunk {cid} "
+                          f"(you gave: \"{evidence[:MAX_EVIDENCE_CHARS]}\")")
         explanation = (q.get("explanation") or "").strip()
         if not explanation:
             raise Invalid(f"question {i} has no explanation")
