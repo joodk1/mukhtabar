@@ -241,6 +241,16 @@ def link_chunks(conn: sqlite3.Connection, topic_id: int, chunk_ids: list[int], p
 
 
 def move_links(conn: sqlite3.Connection, from_topic: int, to_topic: int) -> None:
+    """Move a topic's chunk links onto another topic. Where the target already
+    links the chunk, the moved link is dropped, upgrading the target's link to
+    primary if the moved one was primary (a chunk keeps exactly one primary)."""
+    overlap = "SELECT chunk_id FROM topic_chunks WHERE topic_id = ?"
+    upgrade = [r[0] for r in conn.execute(
+        f"SELECT chunk_id FROM topic_chunks WHERE topic_id = ? AND is_primary = 1 AND chunk_id IN ({overlap})",
+        (from_topic, to_topic))]
+    conn.execute(f"DELETE FROM topic_chunks WHERE topic_id = ? AND chunk_id IN ({overlap})", (from_topic, to_topic))
+    conn.executemany("UPDATE topic_chunks SET is_primary = 1 WHERE topic_id = ? AND chunk_id = ?",
+                     [(to_topic, c) for c in upgrade])
     conn.execute("UPDATE topic_chunks SET topic_id = ? WHERE topic_id = ?", (to_topic, from_topic))
 
 
