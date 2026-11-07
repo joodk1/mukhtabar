@@ -13,6 +13,8 @@
     python -m mukhtabar.topics include  CHUNK_ID [CHUNK_ID ...]
     python -m mukhtabar.topics exclude  CHUNK_ID [CHUNK_ID ...] [--reason "..."]
     python -m mukhtabar.topics clear-cache --set NAME
+    python -m mukhtabar.topics weights  --set NAME
+    python -m mukhtabar.topics weight   --set NAME --chapter N|TITLE (--percent X | --clear)
 
 Model calls happen only in build and assign, and only after the estimate is
 shown and confirmed (interactively, or with --yes).
@@ -984,6 +986,19 @@ def _confirm(e: Estimate, yes: bool) -> None:
         raise SystemExit("Not confirmed: no model calls made (re-run with --yes to make them).")
 
 
+def resolve_chapter(conn, study_set_id: int, ref: str) -> str:
+    """A chapter by its number in outline order (1-based) or its exact title."""
+    chapters = db.chapters(conn, study_set_id)
+    if ref.strip().isdigit():
+        n = int(ref)
+        if not 1 <= n <= len(chapters):
+            raise SystemExit(f"No chapter {n}; the set has {len(chapters)} (see `weights`)")
+        return chapters[n - 1]
+    if ref not in chapters:
+        raise SystemExit(f"No chapter titled {ref!r} (see `weights`)")
+    return ref
+
+
 def _stopped(e: Exception) -> str:
     return (f"Stopped: {e}\n"
             "Finished batches are saved; run the same command again to continue without repeating them.")
@@ -1046,6 +1061,12 @@ def main(argv: list[str] | None = None) -> None:
     exc.add_argument("chunk_ids", type=int, nargs="+")
     exc.add_argument("--reason")
     with_set(sub.add_parser("clear-cache", help="forget saved map replies, so the next build asks the model again"))
+    with_set(sub.add_parser("weights", help="chapters and their exam weights (optional)"))
+    wt = with_set(sub.add_parser("weight", help="set or clear a chapter's exam weight, in percent"))
+    wt.add_argument("--chapter", required=True, help="chapter number (as listed by `weights`) or title")
+    group = wt.add_mutually_exclusive_group(required=True)
+    group.add_argument("--percent", type=float)
+    group.add_argument("--clear", action="store_true")
 
     args = parser.parse_args(argv)
     conn = db.connect(args.db)
@@ -1139,6 +1160,23 @@ def main(argv: list[str] | None = None) -> None:
             print(f"Included {n} chunks. They have no topic yet: run `assign` (or rebuild) to place them.")
         else:
             print(f"Excluded {n} chunks; their topic links were removed.")
+    elif args.command == "weights":
+        s = _get_set(conn, args.set)
+        weights = db.chapter_weights(conn, s["id"])
+        for i, ch in enumerate(db.chapters(conn, s["id"]), start=1):
+            w = weights.get(ch)
+            print(f"{i:3}. {ch}  {'-' if w is None else f'{w:g}%'}")
+        if weights:
+            print(f"total: {sum(weights.values()):g}%")
+    elif args.command == "weight":
+        s = _get_set(conn, args.set)
+        chapter = resolve_chapter(conn, s["id"], args.chapter)
+        if not args.clear and not 0 <= args.percent <= 100:
+            raise SystemExit("--percent must be between 0 and 100")
+        with conn:
+            db.set_chapter_weight(conn, s["id"], chapter, None if args.clear else args.percent)
+        total = sum(db.chapter_weights(conn, s["id"]).values())
+        print(f"{chapter}: {'cleared' if args.clear else f'{args.percent:g}%'} (all chapters now total {total:g}%)")
     elif args.command == "clear-cache":
         s = _get_set(conn, args.set)
         with conn:

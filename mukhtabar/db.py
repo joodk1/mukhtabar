@@ -128,6 +128,16 @@ MIGRATIONS = [
     """
     ALTER TABLE llm_calls ADD COLUMN rejections TEXT;  -- JSON list of validation errors
     """,
+    # 7: arithmetic of calculation questions (checked in code), and optional exam weights per chapter
+    """
+    ALTER TABLE questions ADD COLUMN calculation TEXT;  -- JSON {"expression", "result"}, for calculation MCQs
+    CREATE TABLE chapter_weights (
+        study_set_id INTEGER NOT NULL REFERENCES study_sets(id) ON DELETE CASCADE,
+        chapter      TEXT NOT NULL,                       -- as on topics.chapter
+        weight       REAL NOT NULL,                       -- share of the exam, in percent
+        PRIMARY KEY (study_set_id, chapter)
+    );
+    """,
 ]
 
 
@@ -392,13 +402,42 @@ def topic_sources(conn: sqlite3.Connection, topic_id: int) -> list[sqlite3.Row]:
 def add_question(conn: sqlite3.Connection, topic_id: int, q: dict, model: str) -> int:
     cur = conn.execute(
         """INSERT INTO questions (topic_id, chunk_id, type, prompt, options, answer, key_points, explanation,
-                                  evidence, model, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                  evidence, model, created_at, calculation)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (topic_id, q["chunk_id"], q["type"], q["prompt"],
          json.dumps(q.get("options"), ensure_ascii=False) if q.get("options") else None,
          str(q["answer"]), json.dumps(q.get("key_points"), ensure_ascii=False) if q.get("key_points") else None,
-         q["explanation"], q["evidence"], model, _now()),
+         q["explanation"], q["evidence"], model, _now(),
+         json.dumps(q["calculation"], ensure_ascii=False) if q.get("calculation") else None),
     )
     return cur.lastrowid
+
+
+def delete_question(conn: sqlite3.Connection, question_id: int) -> None:
+    conn.execute("DELETE FROM questions WHERE id = ?", (question_id,))
+
+
+# --- Exam weights per chapter (optional) ---
+
+def chapter_weights(conn: sqlite3.Connection, study_set_id: int) -> dict[str, float]:
+    """Chapter -> share of the exam in percent. Empty when the set has no weights."""
+    return dict(conn.execute("SELECT chapter, weight FROM chapter_weights WHERE study_set_id = ?", (study_set_id,)))
+
+
+def set_chapter_weight(conn: sqlite3.Connection, study_set_id: int, chapter: str, weight: float | None) -> None:
+    """Set a chapter's weight, or remove it with None."""
+    if weight is None:
+        conn.execute("DELETE FROM chapter_weights WHERE study_set_id = ? AND chapter = ?", (study_set_id, chapter))
+    else:
+        conn.execute("INSERT OR REPLACE INTO chapter_weights (study_set_id, chapter, weight) VALUES (?, ?, ?)",
+                     (study_set_id, chapter, weight))
+
+
+def chapters(conn: sqlite3.Connection, study_set_id: int) -> list[str]:
+    """The set's chapters as they appear on its topics, in outline order."""
+    rows = conn.execute("SELECT chapter FROM topics WHERE study_set_id = ? AND chapter IS NOT NULL ORDER BY position",
+                        (study_set_id,)).fetchall()
+    return list(dict.fromkeys(r[0] for r in rows))
 
 
 def questions(conn: sqlite3.Connection, topic_id: int) -> list[sqlite3.Row]:

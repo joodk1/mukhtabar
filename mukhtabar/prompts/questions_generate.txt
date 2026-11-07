@@ -15,7 +15,9 @@ Rules:
 - Every question must be answerable from one study chunk alone; set "chunk_id" to that chunk.
 - "evidence": copy, word for word, the one sentence (at most about 400 characters) from that chunk that best supports the correct answer. If the sentence is longer, copy a continuous part of it. Do not reorder or fix it.
 - Use only facts in the material. No general knowledge, no invented numbers.
-- Test understanding, not page trivia: definitions, differences, causes and effects, calculations shown in the text.
+- Test understanding, not page trivia: definitions, differences, causes and effects.
+- Include a calculation question when a chunk shows a worked example: use that method, with the numbers in your question.
+- Never ask about the exam itself: how many questions it has, chapter weights, the syllabus or learning objectives, its duration or format.
 - Each question tests a different point; spread them across the study chunks where possible.
 - Exactly 4 options, one correct ("answer_index", 0-3). Wrong options must be plausible and clearly wrong according to the material. Vary the position of the correct answer.
 - "explanation": one or two sentences on why the answer is correct, pointing to the material.

@@ -1,0 +1,33 @@
+You are writing exam-revision calculation questions for a student, about one study topic, using only their own study material. You will receive the topic and chunks of material, each wrapped in <chunk id="..." pages="..." kind="...">...</chunk>.
+
+- kind="study": textbook or summary text that shows a worked calculation (a formula, or an example worked through with numbers). Base every question on one of these.
+- kind="practice": existing exam or practice questions. Use them ONLY to see the exam's style and level. Never copy or closely paraphrase them, and never base a question on them.
+
+Note: in these texts an equation is sometimes printed right to left, e.g. "0.125 = 4 ÷ 0.50" meaning 0.50 ÷ 4 = 0.125. Work out the intended order from the meaning.
+
+Topic: {{topic}}
+{{summary}}
+
+Questions this topic already has (don't repeat them or test the same point):
+{{existing}}
+
+Write exactly {{n}} new multiple-choice calculation questions.
+
+Rules:
+- Each question asks the student to compute a value using the method shown in one study chunk; set "chunk_id" to that chunk.
+- Use the chunk's own numbers, or change them a little so the student must apply the method rather than recall the answer.
+- "calculation": the arithmetic that gives the correct answer, so it can be checked:
+  - "expression": plain arithmetic using only numbers, + - * / and brackets, e.g. "(2.30 - 2.00) / 2.00 * 100". Use only numbers that appear in your question or in the chunk. Write percentages as numbers (15 for 15%).
+  - "result": the value of the expression.
+- The correct option must show that result (rounded as an exam would show it); no wrong option may show it. Wrong options should be common mistakes (wrong formula, wrong order, forgetting to multiply by 100).
+- "evidence": copy, word for word, the one sentence (at most about 400 characters) from that chunk that shows the method. Do not reorder or fix it.
+- "explanation": one or two sentences showing the working.
+- Exactly 4 options, one correct ("answer_index", 0-3). Vary the position of the correct answer.
+- Never ask about the exam itself (number of questions, weights, syllabus, format).
+- Write everything in {{language}}.
+
+Reply with JSON only, in exactly this shape:
+{"questions": [
+  {"prompt": "...", "options": ["...", "...", "...", "..."], "answer_index": 0, "explanation": "...", "chunk_id": 1, "evidence": "...",
+   "calculation": {"expression": "...", "result": 0}}
+]}

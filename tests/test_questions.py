@@ -264,3 +264,123 @@ def test_corrected_questions_are_stored_against_the_real_chunk(conn):
     stored = db.questions(conn, tid)
     assert all(questions.canon(q["evidence"]) in questions.canon(db.get_chunk(conn, q["chunk_id"])["text"])
                for q in stored)
+
+
+# --- Exam logistics --------------------------------------------------------------
+
+@pytest.mark.parametrize("prompt", [
+    "كم عدد الأسئلة المتوقع أن يتضمنها الفصل الأول في الاختبار؟",
+    "ما وزن الفصل الثالث في الاختبار؟",
+    "ما الذي تنص عليه خطة المنهاج لهذا الفصل؟",
+    "How many exam questions come from chapter 2?",
+])
+def test_questions_about_the_exam_itself_are_rejected(prompt):
+    q = one_question(1, QUOTE_IN_1)
+    q["questions"][0]["prompt"] = prompt
+    with pytest.raises(Invalid, match="about the exam itself"):
+        questions.validate_questions(q, STUDY_ROWS, 1, "ar" if "ا" in prompt else "en", set(), [])
+
+
+def test_subject_questions_that_mention_a_test_are_fine():
+    q = one_question(1, QUOTE_IN_1)
+    q["questions"][0]["prompt"] = "ما الغرض من اختبار الملاءمة الذي يجريه المستشار المالي قبل التوصية بسند معين؟"
+    assert questions.validate_questions(q, STUDY_ROWS, 1, "ar", set(), [])
+
+
+# --- Arithmetic ------------------------------------------------------------------
+
+def test_evaluate_is_safe_and_reads_arabic_digits_and_operators():
+    assert questions.evaluate("(2.30 - 2.00) / 2.00 * 100") == pytest.approx(15)
+    assert questions.evaluate("٢٥٬٠٠٠ ÷ ٠٫٠٤".replace("٬", ",")) == pytest.approx(625000)
+    assert questions.evaluate("1,875 × 10") == pytest.approx(18750)
+    for bad in ("__import__('os')", "abs(-2)", "x + 1"):
+        with pytest.raises(ValueError):
+            questions.evaluate(bad)
+
+
+CALC_SOURCE = "مثال محلول: إذا كان سعر تداول الوحدة 2.30 وصافي قيمة الأصول 2.00 فإن العلاوة = (2.30 - 2.00) ÷ 2.00 × 100 = 15%."
+
+
+def check(expression, result, options, answer=0, prompt="سعر الوحدة 2.30 وصافي قيمة الأصول 2.00، كم نسبة العلاوة؟"):
+    return questions.check_calculation({"expression": expression, "result": result}, 1, prompt, options, answer,
+                                       CALC_SOURCE)
+
+
+def test_a_correct_calculation_passes():
+    assert check("(2.30 - 2.00) / 2.00 * 100", 15, ["15%", "13%", "30%", "0.30%"])["result"] == pytest.approx(15)
+    assert check("(2.30 - 2.00) / 2.00", 0.15, ["15%", "13%", "30%", "1.5%"])   # a fraction shown as a percent
+
+
+@pytest.mark.parametrize("args, message", [
+    (("(2.30 - 2.00) / 2.00 * 100", 20, ["15%", "13%", "30%", "0.3%"]), "not the stated result 20"),
+    (("(2.30 - 2.00) / 2.00 * 100", 15, ["13%", "15%", "30%", "0.3%"]), "correct option doesn't show"),
+    (("(2.30 - 2.00) / 2.00 * 100", 15, ["15%", "15.0%", "30%", "0.3%"]), "a wrong option also shows"),
+    (("(2.75 - 2.00) / 2.00 * 100", 37.5, ["37.5%", "13%", "30%", "0.3%"]), "aren't in the question"),
+    (("abs(2.30)", 2.3, ["2.3", "13", "30", "0.3"]), "can't be evaluated"),
+])
+def test_a_calculation_that_doesnt_check_out_is_rejected(args, message):
+    with pytest.raises(Invalid, match=message):
+        check(*args)
+
+
+# --- Calculation mode ------------------------------------------------------------
+
+@pytest.fixture
+def calc_conn(conn):
+    """Adds a worked-example chunk to the topic."""
+    with conn:
+        sid = conn.execute("SELECT id FROM study_sets").fetchone()[0]
+        doc = conn.execute("SELECT id FROM documents").fetchone()[0]
+        conn.execute("INSERT INTO chunks (study_set_id, document_id, page, page_end, text, position) VALUES (?, ?, 9, 9, ?, 99)",
+                     (sid, doc, CALC_SOURCE))
+        cid = conn.execute("SELECT MAX(id) FROM chunks").fetchone()[0]
+        db.link_chunks(conn, topic_id(conn), [cid])
+    return conn
+
+
+def calc_model(bad_first=False):
+    calls = []
+
+    def completion(messages, **kwargs):
+        calls.append(messages)
+        n = int(re.search(r"Write exactly (\d+) new", messages[0]["content"]).group(1))
+        cid = int(re.findall(r'<chunk id="(\d+)"[^>]*kind="study"', messages[1]["content"])[0])
+        prompts = ["إذا كان سعر الوحدة 2.30 وصافي قيمة الأصول 2.00، احسب نسبة العلاوة",
+                   "صندوق مغلق تتداول وحدته عند 2.30 بينما صافي قيمة أصوله للوحدة 2.00؛ ما مقدار علاوته بالنسبة المئوية؟",
+                   "مستثمر يقارن بين السعر السوقي 2.30 والقيمة الصافية 2.00 لوحدة صندوق؛ كم تبلغ العلاوة؟"]
+        qs = [{"prompt": prompts[i],
+               "options": ["15%", "13%", "30%", "0.30%"], "answer_index": 0, "explanation": "الفرق مقسوما على صافي القيمة.",
+               "chunk_id": cid, "evidence": CALC_SOURCE,
+               "calculation": {"expression": "(2.30 - 2.00) / 2.00 * 100", "result": 15}} for i in range(n)]
+        if bad_first and len(messages) == 2:
+            qs[0]["calculation"]["result"] = 20
+        return reply({"questions": qs})
+    completion.calls = calls
+    return completion
+
+
+def test_calc_topics_are_those_with_worked_calculations(conn, calc_conn):
+    sid = conn.execute("SELECT id FROM study_sets").fetchone()[0]
+    assert questions.calc_topics(calc_conn, sid) == [topic_id(calc_conn)]
+    study, _ = questions.select_sources(db.topic_sources(calc_conn, topic_id(calc_conn)), calc=True)
+    assert [c["text"] for c in study] == [CALC_SOURCE]
+
+
+def test_calc_mode_adds_two_checked_calculation_questions_up_to_the_cap(calc_conn):
+    tid = topic_id(calc_conn)
+    questions.generate(calc_conn, "Set Q", "fake", [tid], completion=fake())          # 6 regular questions
+    model = calc_model(bad_first=True)
+    added, failed = questions.generate(calc_conn, "Set Q", "fake", [tid], calc=True, completion=model)
+    assert added == {tid: 2} and failed == {}
+    assert "not the stated result" in model.calls[1][-1]["content"]                  # bad arithmetic was rejected
+    stored = [q for q in db.questions(calc_conn, tid) if q["calculation"]]
+    assert len(stored) == 2 and json.loads(stored[0]["calculation"])["result"] == pytest.approx(15)
+    assert len(db.questions(calc_conn, tid)) == 8
+    # Already at its calculation quota (and the cap): nothing more.
+    assert questions.generate(calc_conn, "Set Q", "fake", [tid], calc=True, completion=calc_model()) == ({}, {})
+
+
+def test_calc_mode_respects_the_cap(calc_conn):
+    tid = topic_id(calc_conn)
+    questions.generate(calc_conn, "Set Q", "fake", [tid], n=7, completion=fake())
+    assert questions.missing(calc_conn, tid, 6, calc=True) == 1                       # 7 + 1 = MAX_PER_TOPIC

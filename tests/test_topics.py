@@ -516,3 +516,19 @@ def test_merge_handles_chunks_both_topics_link(conn):
     assert [tuple(r) for r in rows] == [(keep, 1)]              # one link, now primary
     per_chunk = conn.execute("SELECT SUM(is_primary) FROM topic_chunks GROUP BY chunk_id").fetchall()
     assert all(r[0] == 1 for r in per_chunk)
+
+
+def test_chapter_weights_are_optional_and_editable(conn):
+    sid = set_id(conn)
+    topics.build(conn, "Set A", "fake", topics.select_chunks(conn, sid), completion=fake_model())
+    assert db.chapter_weights(conn, sid) == {}                                       # sets work without weights
+    chapter = db.chapters(conn, sid)[0]
+    with conn:
+        db.set_chapter_weight(conn, sid, chapter, 14)
+    assert db.chapter_weights(conn, sid) == {chapter: 14}
+    assert topics.resolve_chapter(conn, sid, "1") == chapter == topics.resolve_chapter(conn, sid, chapter)
+    with pytest.raises(SystemExit):
+        topics.resolve_chapter(conn, sid, "99")
+    with conn:
+        db.set_chapter_weight(conn, sid, chapter, None)
+    assert db.chapter_weights(conn, sid) == {}
