@@ -86,6 +86,16 @@ MIGRATIONS = [
         created_at    TEXT NOT NULL
     );
     """,
+    # 3: finished map batches, so an interrupted build resumes without repeating paid calls
+    """
+    CREATE TABLE llm_cache (
+        key          TEXT PRIMARY KEY,           -- sha256 of model + exact messages
+        study_set_id INTEGER NOT NULL REFERENCES study_sets(id) ON DELETE CASCADE,
+        purpose      TEXT NOT NULL,
+        reply        TEXT NOT NULL,              -- the validated JSON reply
+        created_at   TEXT NOT NULL
+    );
+    """,
 ]
 
 
@@ -279,3 +289,24 @@ def log_llm_call(conn: sqlite3.Connection, study_set_id: int | None, record: dic
          record.get("error"), record.get("seconds"), _now()),
     )
     conn.commit()
+
+
+def rename_study_set(conn: sqlite3.Connection, old: str, new: str) -> None:
+    cur = conn.execute("UPDATE study_sets SET name = ? WHERE name = ?", (new, old))
+    if cur.rowcount != 1:
+        raise ValueError(f"No study set named {old!r}")
+
+
+def cache_get(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT reply FROM llm_cache WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def cache_put(conn: sqlite3.Connection, key: str, study_set_id: int, purpose: str, reply: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO llm_cache (key, study_set_id, purpose, reply, created_at) VALUES (?, ?, ?, ?, ?)",
+                 (key, study_set_id, purpose, reply, _now()))
+    conn.commit()
+
+
+def cache_clear(conn: sqlite3.Connection, study_set_id: int) -> None:
+    conn.execute("DELETE FROM llm_cache WHERE study_set_id = ?", (study_set_id,))

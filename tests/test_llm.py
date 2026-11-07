@@ -100,6 +100,17 @@ def test_rate_limit_gives_up_after_the_last_wait():
     assert waits == [10, 30, 60]
 
 
+def test_per_minute_limit_worded_as_quota_is_waited_out():
+    # Gemini words its free-tier per-minute limit like a quota error.
+    waits = []
+    per_minute = RateLimitError("429 You exceeded your current quota, please check your plan and billing details. "
+                                "Quota exceeded for metric: generate_content_free_tier_requests, limit: 15, "
+                                "quotaId: GenerateRequestsPerMinutePerProjectPerModel-FreeTier, retryDelay: 41s")
+    result, _ = complete_json([], validate=needs_answer, model="fake", purpose="t",
+                              completion=failing_then([per_minute]), sleep=waits.append)
+    assert result == 1 and waits == [41.0]
+
+
 def test_exhausted_quota_stops_at_once():
     from mukhtabar.llm import QuotaExhausted
     waits = []

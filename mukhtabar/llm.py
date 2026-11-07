@@ -26,7 +26,10 @@ RETRY_PROMPT = "Your reply was invalid: {error}\nReply again with the corrected 
 RATE_LIMIT_WAITS = (10, 30, 60)
 TRANSIENT_WAITS = (5, 15)
 MAX_WAIT = 90
-QUOTA = re.compile(r"per[ _-]?day|perday|daily|quota exceeded for quota metric.*day|exceeded your current quota", re.I)
+# Only an explicitly daily limit counts as exhausted quota. Providers word
+# per-minute and per-day errors alike ("You exceeded your current quota"), so
+# anything else is treated as a rate limit, which still gets only a few waits.
+QUOTA = re.compile(r"per[ _-]?day|perday|daily", re.I)
 RETRY_DELAY = re.compile(r"retry(?:Delay)?\D{0,12}(\d+(?:\.\d+)?)\s*s", re.I)
 TRANSIENT_NAMES = ("Timeout", "APIConnectionError", "InternalServerError", "ServiceUnavailableError")
 # Error messages can echo a request URL that carries the key (Gemini uses ?key=...).
@@ -179,7 +182,7 @@ def complete_json(
     except LLMError:
         raise
     except Exception as e:  # after backoff: quota, auth, unknown model, bad request, ...
-        error = redact(f"{type(e).__name__}: {str(e)[:500]}")
+        error = redact(f"{type(e).__name__}: {str(e)[:2000]}")
         if classify_error(e) == "quota":
             raise QuotaExhausted(f"{purpose}: quota exhausted, stopping ({error})") from e
         raise LLMError(f"{purpose}: {error}") from e

@@ -233,3 +233,45 @@ def test_estimate_makes_no_model_call(conn):
     assert e.calls == len(batches) + 1 and e.input_tokens > 0 and e.output_tokens > 0
     assert e.input_price and e.cost() > 0
     assert "Model: gemini/gemini-2.5-flash" in topics.describe(e)
+
+
+def test_interrupted_build_resumes_without_repeating_finished_batches(conn):
+    from mukhtabar.llm import LLMError
+    sid = set_id(conn)
+    chunks = topics.select_chunks(conn, sid)
+    batches = topics.make_batches(chunks, topics.set_hints(conn, sid), budget=1_000)
+    assert len(batches) >= 3
+    good = fake_model()
+    map_calls = []
+
+    def quota_on_second_map(messages, **kwargs):
+        if "Group the chunks" in messages[0]["content"]:
+            map_calls.append(1)
+            if len(map_calls) == 2:
+                raise RuntimeError("429 RESOURCE_EXHAUSTED: quota exceeded, limit per day")
+        return good(messages, **kwargs)
+
+    with pytest.raises(LLMError):
+        topics.build(conn, "Set A", "fake", chunks, completion=quota_on_second_map, batch_chars=1_000)
+    assert db.topics(conn, sid) == []  # nothing half-built
+    assert topics.cached_batches(conn, "fake", batches, "ar") == 1
+
+    resumed = []
+
+    def counting(messages, **kwargs):
+        if "Group the chunks" in messages[0]["content"]:
+            resumed.append(1)
+        return good(messages, **kwargs)
+    topics.build(conn, "Set A", "fake", chunks, completion=counting, batch_chars=1_000)
+    assert len(resumed) == len(batches) - 1  # the finished first batch wasn't asked again
+    assert db.topics(conn, sid)
+    assert conn.execute("SELECT COUNT(*) FROM llm_cache").fetchone()[0] == 0  # cleared after success
+
+
+def test_estimate_counts_only_unfinished_batches(conn):
+    chunks = topics.select_chunks(conn, set_id(conn))
+    batches = topics.make_batches(chunks, topics.set_hints(conn, set_id(conn)), budget=1_000)
+    full = topics.estimate("gemini/gemini-2.5-flash", batches, "ar", token_counter=len)
+    resumed = topics.estimate("gemini/gemini-2.5-flash", batches, "ar", token_counter=len, saved=1)
+    assert resumed.calls == full.calls - 1 and resumed.input_tokens < full.input_tokens
+    assert "Resuming: 1 of" in topics.describe(resumed)

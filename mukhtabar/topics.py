@@ -16,6 +16,7 @@ shown and confirmed (interactively, or with --yes).
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -387,6 +388,7 @@ class Estimate:
     input_price: float | None    # USD per token
     output_price: float | None
     thinking_per_call: int
+    saved: int = 0               # batches reused from an interrupted run
 
     def cost(self, retry_share: float = 0.0, thinking: bool = False) -> float | None:
         if self.input_price is None or self.output_price is None:
@@ -399,10 +401,11 @@ THINKING_ALLOWANCE = 3000   # output tokens per call a reasoning model may spend
 
 
 def estimate(model: str, batches: list[Batch], language: str, extra_calls: int = 1,
-             token_counter: Callable[[str], int] | None = None) -> Estimate:
+             token_counter: Callable[[str], int] | None = None, saved: int = 0) -> Estimate:
     """Token and cost estimate with no model call. Tokens are counted locally with
     LiteLLM's tokenizer for the model (an approximation for Gemini); output is
-    estimated from the batch sizes."""
+    estimated from the batch sizes. The first `saved` batches already have a saved
+    reply (an interrupted run) and cost nothing."""
     import litellm
 
     if token_counter is None:
@@ -412,10 +415,12 @@ def estimate(model: str, batches: list[Batch], language: str, extra_calls: int =
     inp = out = 0
     local_topics = 0
     for b in batches:
-        msgs = _map_messages(b, language, "")
-        inp += sum(token_counter(m["content"]) for m in msgs)
         topics = min(MAP_MAX_TOPICS, max(1, len(b.chunks) // 4))
         local_topics += topics
+        if b.index <= saved:
+            continue
+        msgs = _map_messages(b, language, "")
+        inp += sum(token_counter(m["content"]) for m in msgs)
         out += 30 + topics * 70 + len(b.chunks) * 4
     # Reduce (and assign's placement call): local topic lines in, final topics out.
     for _ in range(extra_calls):
@@ -424,8 +429,8 @@ def estimate(model: str, batches: list[Batch], language: str, extra_calls: int =
         out += max(1, local_topics // 2) * 70 + local_topics * 6
     info = litellm.model_cost.get(model) or litellm.model_cost.get(model.split("/", 1)[-1]) or {}
     thinking = THINKING_ALLOWANCE if info.get("supports_reasoning") else 0
-    return Estimate(model, sum(len(b.chunks) for b in batches), len(batches), len(batches) + extra_calls,
-                    inp, out, info.get("input_cost_per_token"), info.get("output_cost_per_token"), thinking)
+    return Estimate(model, sum(len(b.chunks) for b in batches), len(batches), len(batches) - saved + extra_calls,
+                    inp, out, info.get("input_cost_per_token"), info.get("output_cost_per_token"), thinking, saved)
 
 
 def describe(e: Estimate) -> str:
@@ -436,6 +441,9 @@ def describe(e: Estimate) -> str:
         f"Chunks: {e.chunks} in {e.batches} batches; model calls: {e.calls} (+ retries if a reply is invalid)",
         f"Estimated tokens: ~{e.input_tokens:,} in, ~{e.output_tokens:,} out",
     ]
+    if e.saved:
+        lines.insert(2, f"Resuming: {e.saved} of {e.batches} batches already done in an earlier run "
+                        "(no new calls for them)")
     if e.input_price is not None:
         lines.append(f"Prices (LiteLLM's table; check your provider's page): "
                      f"${e.input_price * 1e6:.3f}/M in, ${e.output_price * 1e6:.3f}/M out")
@@ -451,15 +459,49 @@ def describe(e: Estimate) -> str:
 Logger = Callable[[dict], None]
 
 
-def _run_map(batches, language, model, log, completion, extra) -> tuple[list[LocalTopic], dict[int, str]]:
+def _cache_key(model: str, messages: list[dict]) -> str:
+    return hashlib.sha256(json.dumps([model, messages], ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _cached_map(conn, model, batch, language, previous) -> MapResult | None:
+    reply = db.cache_get(conn, _cache_key(model, _map_messages(batch, language, previous)))
+    return validate_map(json.loads(reply), batch, language) if reply else None
+
+
+def cached_batches(conn, model: str, batches: list[Batch], language: str) -> int:
+    """How many leading batches already have a saved reply (no model call)."""
+    previous, n = "", 0
+    for b in batches:
+        result = _cached_map(conn, model, b, language, previous)
+        if result is None:
+            break
+        previous, n = result.topics[-1].title, n + 1
+    return n
+
+
+def _run_map(conn, set_id, batches, language, model, log, completion, extra) -> tuple[list[LocalTopic], dict[int, str]]:
+    """Map every batch. A batch whose exact prompt was answered before (an
+    interrupted run) reuses the saved reply instead of calling the model again."""
     local: list[LocalTopic] = []
     non_study: dict[int, str] = {}
     previous = ""
     for b in batches:
-        print(f"  map batch {b.index}/{len(batches)}: {len(b.chunks)} chunks", flush=True)
-        result, _ = complete_json(
-            _map_messages(b, language, previous), model=model, purpose="topics.map", log=log,
-            validate=lambda obj, b=b: validate_map(obj, b, language), completion=completion, extra=extra)
+        messages = _map_messages(b, language, previous)
+        result = _cached_map(conn, model, b, language, previous)
+        if result is not None:
+            print(f"  map batch {b.index}/{len(batches)}: reused the saved reply", flush=True)
+        else:
+            print(f"  map batch {b.index}/{len(batches)}: {len(b.chunks)} chunks", flush=True)
+            raw: list = []
+
+            def validate(obj, b=b, raw=raw):
+                result = validate_map(obj, b, language)
+                raw.append(obj)
+                return result
+            result, _ = complete_json(messages, model=model, purpose="topics.map", log=log,
+                                      validate=validate, completion=completion, extra=extra)
+            db.cache_put(conn, _cache_key(model, messages), set_id, "topics.map",
+                         json.dumps(raw[-1], ensure_ascii=False))
         local += result.topics
         non_study.update(result.non_study)
         previous = result.topics[-1].title
@@ -489,7 +531,7 @@ def build(conn: sqlite3.Connection, set_name: str, model: str, chunks: list[sqli
     def log(record):
         db.log_llm_call(conn, set_id, record)
 
-    local, non_study = _run_map(batches, language, model, log, completion, extra)
+    local, non_study = _run_map(conn, set_id, batches, language, model, log, completion, extra)
     chapters = list(dict.fromkeys(h.title for h in hints if any(chapter_of(c, [h]) for c in chunks)))
     system = _prompt(
         "topics_reduce", language=_language_name(language), max_topics=cap,
@@ -513,6 +555,7 @@ def build(conn: sqlite3.Connection, set_name: str, model: str, chunks: list[sqli
             tid = db.add_topic(conn, set_id, t.title, t.summary, t.chapter, pos)
             db.link_chunks(conn, tid, [c for lid in t.local_ids for c in by_id[lid].chunk_ids])
             ids.append(tid)
+        db.cache_clear(conn, set_id)  # done: a later rebuild starts fresh
     return ids
 
 
@@ -533,7 +576,8 @@ def assign(conn: sqlite3.Connection, set_name: str, model: str, *, completion: C
     def log(record):
         db.log_llm_call(conn, set_id, record)
 
-    local, non_study = _run_map(make_batches(chunks, hints, batch_chars), language, model, log, completion, extra)
+    local, non_study = _run_map(conn, set_id, make_batches(chunks, hints, batch_chars), language, model, log,
+                                completion, extra)
     existing_lines = "\n".join(json.dumps({"id": t["id"], "title": t["title"], "summary": t["summary"]},
                                           ensure_ascii=False) for t in db.topics(conn, set_id))
     placements, _ = complete_json(
@@ -558,6 +602,7 @@ def assign(conn: sqlite3.Connection, set_name: str, model: str, *, completion: C
                 tid = new_topics[p.new_title]
             db.link_chunks(conn, tid, by_id[p.local_id].chunk_ids)
             placed += len(by_id[p.local_id].chunk_ids)
+        db.cache_clear(conn, set_id)
     return placed, len(new_topics)
 
 
@@ -612,6 +657,11 @@ def _confirm(e: Estimate, yes: bool) -> None:
         raise SystemExit("Not confirmed: re-run with --yes to make these model calls.")
     if input("Make these model calls? [y/N] ").strip().lower() != "y":
         raise SystemExit("Cancelled.")
+
+
+def _stopped(e: Exception) -> str:
+    return (f"Stopped: {e}\n"
+            "Finished batches are saved; run the same command again to continue without repeating them.")
 
 
 def _model(args) -> str:
@@ -679,7 +729,7 @@ def main(argv: list[str] | None = None) -> None:
         model = _model(args)
         chunks = select_chunks(conn, s["id"], parse_only(args.only) if args.only else None, args.chapter)
         batches = make_batches(chunks, set_hints(conn, s["id"]), args.batch_chars)
-        e = estimate(model, batches, s["language"])
+        e = estimate(model, batches, s["language"], saved=cached_batches(conn, model, batches, s["language"]))
         if args.command == "estimate":
             print(describe(e))
             return
@@ -694,7 +744,7 @@ def main(argv: list[str] | None = None) -> None:
         try:
             ids = build(conn, args.set, model, chunks, force=args.force, extra=extra, batch_chars=args.batch_chars)
         except LLMError as e:  # message only: the chained error could echo a request URL
-            raise SystemExit(f"Stopped, nothing saved: {e}") from None
+            raise SystemExit(_stopped(e)) from None
         print(f"Built {len(ids)} topics.")
     elif args.command == "assign":
         s = _get_set(conn, args.set)
@@ -703,13 +753,14 @@ def main(argv: list[str] | None = None) -> None:
         if not chunks:
             print("No unassigned chunks.")
             return
-        e = estimate(model, make_batches(chunks, set_hints(conn, s["id"]), args.batch_chars), s["language"])
+        batches = make_batches(chunks, set_hints(conn, s["id"]), args.batch_chars)
+        e = estimate(model, batches, s["language"], saved=cached_batches(conn, model, batches, s["language"]))
         _confirm(e, args.yes)
         extra = {"reasoning_effort": args.reasoning_effort} if args.reasoning_effort else None
         try:
             placed, new = assign(conn, args.set, model, extra=extra, batch_chars=args.batch_chars)
         except LLMError as e:
-            raise SystemExit(f"Stopped, nothing saved: {e}") from None
+            raise SystemExit(_stopped(e)) from None
         print(f"Placed {placed} chunks; {new} new topics.")
     elif args.command == "list":
         s = _get_set(conn, args.set)
