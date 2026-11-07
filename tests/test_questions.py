@@ -204,3 +204,63 @@ def test_evidence_of_a_full_long_sentence_is_accepted(conn):
     q = {"prompt": "ما الذي يحصل عليه حامل السند بشكل دوري حتى الاستحقاق؟", "options": ["قسيمة", "سهم", "عقد", "خيار"],
          "answer_index": 0, "explanation": "لأن النص يذكر ذلك.", "chunk_id": 1, "evidence": long_sentence}
     assert questions.validate_questions({"questions": [q]}, study, 1, "ar", set(), [])[0]["evidence"] == long_sentence
+
+
+def one_question(chunk_id, evidence):
+    return {"questions": [{"prompt": "ما الذي يحصل عليه حامل السند بشكل دوري حتى تاريخ الاستحقاق؟",
+                           "options": ["القسيمة", "الأرباح الموزعة", "رأس المال", "العائد الجاري"], "answer_index": 0,
+                           "explanation": "لأن النص يذكر ذلك.", "chunk_id": chunk_id, "evidence": evidence}]}
+
+
+STUDY_ROWS = [{"id": 1, "text": STUDY[0]}, {"id": 2, "text": STUDY[1]}, {"id": 3, "text": STUDY[2]}]
+QUOTE_IN_1 = "ويحصل حامل السند على فائدة دورية تسمى القسيمة حتى تاريخ الاستحقاق"
+
+
+def test_chunk_id_written_as_text_is_accepted():
+    q = questions.validate_questions(one_question("1", QUOTE_IN_1), STUDY_ROWS, 1, "ar", set(), [])[0]
+    assert q["chunk_id"] == 1 and not q["chunk_corrected"]
+    with pytest.raises(Invalid, match="not one of the study chunks"):
+        questions.validate_questions(one_question("chunk 1", QUOTE_IN_1), STUDY_ROWS, 1, "ar", set(), [])
+
+
+def test_wrong_chunk_is_corrected_when_the_quote_is_in_exactly_one_study_chunk():
+    q = questions.validate_questions(one_question(2, QUOTE_IN_1), STUDY_ROWS, 1, "ar", set(), [])[0]
+    assert q["chunk_id"] == 1 and q["chunk_corrected"]
+
+
+def test_wrong_chunk_is_not_corrected_when_the_quote_is_in_two_chunks():
+    rows = STUDY_ROWS + [{"id": 4, "text": "تكرار: " + STUDY[0]}]
+    with pytest.raises(Invalid, match="word for word"):
+        questions.validate_questions(one_question(2, QUOTE_IN_1), rows, 1, "ar", set(), [])
+
+
+def test_never_corrected_to_a_practice_chunk(conn):
+    # Only the study chunks sent are candidates: a quote found only in practice material is rejected.
+    practice_quote = "ما الفرق بين السند الحكومي وسند الشركة من حيث مستوى المخاطرة"
+    with pytest.raises(Invalid, match="word for word"):
+        questions.validate_questions(one_question(2, practice_quote), STUDY_ROWS, 1, "ar", set(), [])
+    # And a question claiming a practice chunk is still rejected, even if its quote is in a study chunk.
+    tid = topic_id(conn)
+    practice_id = [r["id"] for r in db.topic_sources(conn, tid) if not r["is_primary"]][0]
+    study = [r for r in db.topic_sources(conn, tid) if r["is_primary"]]
+    with pytest.raises(Invalid, match="not one of the study chunks"):
+        questions.validate_questions(one_question(practice_id, QUOTE_IN_1), study, 1, "ar", set(), [])
+
+
+def test_corrected_questions_are_stored_against_the_real_chunk(conn):
+    tid = topic_id(conn)
+    sources = [r for r in db.topic_sources(conn, tid) if r["is_primary"]]
+    wrong = sources[1]["id"]
+    real = sources[0]["id"]
+
+    def misattributing(messages, **kwargs):
+        obj = good_questions(messages[1]["content"], 3)
+        for q in obj["questions"]:
+            if q["chunk_id"] == real:
+                q["chunk_id"] = wrong
+        return reply(obj)
+    added, failed = questions.generate(conn, "Set Q", "fake", [tid], n=3, completion=misattributing)
+    assert added == {tid: 3} and failed == {}
+    stored = db.questions(conn, tid)
+    assert all(questions.canon(q["evidence"]) in questions.canon(db.get_chunk(conn, q["chunk_id"])["text"])
+               for q in stored)

@@ -101,16 +101,28 @@ def validate_questions(obj, study: list, n: int, language: str, practice_shingle
             raise Invalid(f"question {i} has no prompt")
         topics._check_language(prompt, language, f"question {i}")
         cid = q.get("chunk_id")
+        if isinstance(cid, str) and cid.strip().isdigit():
+            cid = int(cid)   # an id written as text ("287") is the same id
         if cid not in texts:
             raise Invalid(f"question {i}: chunk_id {cid!r} is not one of the study chunks "
                           "(practice chunks are style examples only)")
         evidence = (q.get("evidence") or "").strip()
         if len(evidence) > MAX_EVIDENCE_CHARS:
             raise Invalid(f"question {i}: \"evidence\" must be one sentence of at most about 400 characters")
-        if len(canon(evidence)) < MIN_EVIDENCE_CHARS or canon(evidence) not in texts[cid]:
-            # The quote is included so the rejection log shows exactly what didn't match.
+        quote = canon(evidence)
+        corrected = False
+        if len(quote) < MIN_EVIDENCE_CHARS:
             raise Invalid(f"question {i}: \"evidence\" must be copied word for word from chunk {cid} "
                           f"(you gave: \"{evidence[:MAX_EVIDENCE_CHARS]}\")")
+        if quote not in texts[cid]:
+            # Attributed to the wrong chunk? Accept it only if the quote is word for word in
+            # exactly one of the study chunks sent (never a practice chunk), and use that one.
+            matches = [k for k, t in texts.items() if quote in t]
+            if len(matches) != 1:
+                # The quote is included so the rejection log shows exactly what didn't match.
+                raise Invalid(f"question {i}: \"evidence\" must be copied word for word from chunk {cid} "
+                              f"(you gave: \"{evidence[:MAX_EVIDENCE_CHARS]}\")")
+            cid, corrected = matches[0], True
         explanation = (q.get("explanation") or "").strip()
         if not explanation:
             raise Invalid(f"question {i} has no explanation")
@@ -130,7 +142,7 @@ def validate_questions(obj, study: list, n: int, language: str, practice_shingle
         seen.append(own)
         out.append({"type": "mcq", "prompt": prompt, "chunk_id": cid, "evidence": evidence,
                     "explanation": explanation, "options": [o.strip() for o in options],
-                    "answer": q["answer_index"]})
+                    "answer": q["answer_index"], "chunk_corrected": corrected})
     return out
 
 
@@ -226,6 +238,10 @@ def generate(conn, set_name: str, model: str, topic_ids: list[int], *, n: int = 
                 for q in qs:
                     db.add_question(conn, tid, q, model)
             existing += [q["prompt"] for q in qs]
+            fixed = sum(q["chunk_corrected"] for q in qs)
+            if fixed:
+                print(f"    {fixed} question(s) attributed to the wrong chunk: corrected to the chunk the quote is in",
+                      flush=True)
             added[tid] = added.get(tid, 0) + len(qs)
     return added, failed
 
