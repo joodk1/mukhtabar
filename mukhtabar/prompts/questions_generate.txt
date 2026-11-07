@@ -13,7 +13,7 @@ Write exactly {{n}} new multiple-choice questions.
 
 Rules:
 - Every question must be answerable from one study chunk alone; set "chunk_id" to that chunk.
-- "evidence": copy, word for word, a passage of 1-3 sentences from that chunk that supports the correct answer. Do not shorten, reorder or fix it.
+- "evidence": copy, word for word, the one sentence (at most about 200 characters) from that chunk that best supports the correct answer. If the sentence is longer, copy a continuous part of it. Do not reorder or fix it.
 - Use only facts in the material. No general knowledge, no invented numbers.
 - Test understanding, not page trivia: definitions, differences, causes and effects, calculations shown in the text.
 - Each question tests a different point; spread them across the study chunks where possible.

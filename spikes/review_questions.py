@@ -1,7 +1,10 @@
 """Review generated questions next to their source: chunk text with the evidence
 highlighted, and the rendered page of the PDF.
 
-    python spikes/review_questions.py DB PDF_DIR OUT_DIR --topic ID [--topic ID ...]
+    python spikes/review_questions.py DB PDF_DIR OUT_DIR (--topic ID ... | --question ID ...)
+
+--topic shows all of a topic's questions; --question shows just those questions,
+grouped by topic.
 
 Writes OUT_DIR/index.html and OUT_DIR/img/*.png. The page shows your material, so
 keep OUT_DIR somewhere private.
@@ -42,7 +45,8 @@ def main() -> None:
     parser.add_argument("db", type=Path)
     parser.add_argument("pdf_dir", type=Path)
     parser.add_argument("out", type=Path)
-    parser.add_argument("--topic", type=int, action="append", required=True)
+    parser.add_argument("--topic", type=int, action="append", default=[])
+    parser.add_argument("--question", type=int, action="append", default=[])
     args = parser.parse_args()
     (args.out / "img").mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(args.db)
@@ -51,9 +55,17 @@ def main() -> None:
     rendered: dict[str, pdfium.PdfDocument] = {}
     e = html.escape
     sections = []
-    for tid in args.topic:
+    wanted = set(args.question)
+    topic_ids = list(args.topic) + [r[0] for r in conn.execute(
+        f"""SELECT DISTINCT q.topic_id FROM questions q JOIN topics t ON t.id = q.topic_id
+            WHERE q.id IN ({','.join('?' * len(wanted)) or 'NULL'}) ORDER BY t.position""", sorted(wanted))
+        if r[0] not in args.topic]
+    if not topic_ids:
+        parser.error("give --topic or --question")
+    for tid in topic_ids:
         topic = conn.execute("SELECT * FROM topics WHERE id = ?", (tid,)).fetchone()
-        qs = conn.execute("SELECT * FROM questions WHERE topic_id = ? ORDER BY id", (tid,)).fetchall()
+        qs = [q for q in conn.execute("SELECT * FROM questions WHERE topic_id = ? ORDER BY id", (tid,)).fetchall()
+              if tid in args.topic or q["id"] in wanted]
         cards = []
         for n, q in enumerate(qs, start=1):
             c = conn.execute("""SELECT c.*, d.filename FROM chunks c JOIN documents d ON d.id = c.document_id

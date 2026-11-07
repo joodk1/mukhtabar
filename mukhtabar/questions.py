@@ -14,15 +14,19 @@ and confirmed (interactively, or with --yes).
 """
 
 import argparse
+import math
 import re
 import sqlite3
 from typing import Callable
 
 from mukhtabar import db, topics
 from mukhtabar.ingest.extract import normalize
-from mukhtabar.llm import Invalid, LLMError, complete_json
+from mukhtabar.llm import Invalid, LLMError, QuotaExhausted, complete_json
 
 QUESTIONS_PER_TOPIC = 6
+QUESTIONS_PER_CALL = 3       # short replies are less likely to be cut off
+MAX_OUTPUT_TOKENS = 8192     # explicit and generous, so the provider's default never truncates
+MAX_EVIDENCE_CHARS = 220     # "about 200 characters": one sentence, keeps replies short
 SOURCE_CHARS = 20_000        # study text sent per topic
 MAX_PRACTICE_CHUNKS = 3      # practice-question chunks sent as style examples
 MIN_EVIDENCE_CHARS = 20
@@ -101,6 +105,8 @@ def validate_questions(obj, study: list, n: int, language: str, practice_shingle
             raise Invalid(f"question {i}: chunk_id {cid!r} is not one of the study chunks "
                           "(practice chunks are style examples only)")
         evidence = (q.get("evidence") or "").strip()
+        if len(evidence) > MAX_EVIDENCE_CHARS:
+            raise Invalid(f"question {i}: \"evidence\" must be one sentence of at most about 200 characters")
         if len(canon(evidence)) < MIN_EVIDENCE_CHARS or canon(evidence) not in texts[cid]:
             raise Invalid(f"question {i}: \"evidence\" must be copied word for word from chunk {cid}")
         explanation = (q.get("explanation") or "").strip()
@@ -156,52 +162,70 @@ def estimate(conn, set_id: int, topic_ids: list[int], model: str, language: str,
         study, practice = select_sources(db.topic_sources(conn, tid))
         existing = [q["prompt"] for q in db.questions(conn, tid)]
         n_chunks += len(study) + len(practice)
-        inp += sum(token_counter(m["content"])
-                   for m in messages(db.get_topic(conn, tid), study, practice, language, need, existing))
+        per_call = sum(token_counter(m["content"]) for m in messages(
+            db.get_topic(conn, tid), study, practice, language, min(need, QUESTIONS_PER_CALL), existing))
+        k = math.ceil(need / QUESTIONS_PER_CALL)
+        inp += k * per_call   # the study text is resent with every call
         out += need * OUTPUT_TOKENS_PER_QUESTION
-        calls += 1
+        calls += k
     info = litellm.model_cost.get(model) or {}
     thinking = topics.THINKING_ALLOWANCE if info.get("supports_reasoning") else 0
-    return topics.Estimate(model, n_chunks, calls, calls, inp, out,
+    return topics.Estimate(model, n_chunks, len([t for t in topic_ids if missing(conn, t, n)]), calls, inp, out,
                            info.get("input_cost_per_token"), info.get("output_cost_per_token"), thinking)
 
 
 def generate(conn, set_name: str, model: str, topic_ids: list[int], *, n: int = QUESTIONS_PER_TOPIC,
              completion: Callable | None = None, extra: dict | None = None,
-             retry_budget: int = topics.RETRY_BUDGET) -> dict[int, int]:
-    """Bring each topic up to n questions. Each topic is saved as soon as its call
-    succeeds, so a stopped run keeps finished topics. Returns questions added per topic."""
+             retry_budget: int = topics.RETRY_BUDGET) -> tuple[dict[int, int], dict[int, str]]:
+    """Bring each topic up to n questions, at most QUESTIONS_PER_CALL per call,
+    saving each call's questions as soon as it succeeds. A topic whose call fails
+    all its attempts is skipped and the run goes on; exhausted quota or too many
+    invalid replies overall still stop it. Returns (questions added per topic,
+    failed topics with the reason)."""
     study_set = topics._get_set(conn, set_name)
     set_id, language = study_set["id"], study_set["language"]
     log = topics.Budget(conn, set_id, retry_budget)
     practice_all = practice_shingles_for_set(conn, set_id)
-    added = {}
+    extra = {"max_tokens": MAX_OUTPUT_TOKENS, **(extra or {})}
+    added: dict[int, int] = {}
+    failed: dict[int, str] = {}
     for k, tid in enumerate(topic_ids, start=1):
         topic = db.get_topic(conn, tid)
         if topic is None or topic["study_set_id"] != set_id:
             raise ValueError(f"Topic {tid} isn't in study set {set_name!r}")
         existing = [q["prompt"] for q in db.questions(conn, tid)]
-        need = n - len(existing)
-        if need <= 0:
+        if len(existing) >= n:
             print(f"  topic {tid}: already has {len(existing)} questions, skipped", flush=True)
             continue
         study, practice = select_sources(db.topic_sources(conn, tid))
         if not study:
+            failed[tid] = "no study text"
             print(f"  topic {tid}: no study text, skipped", flush=True)
             continue
-        print(f"  [{k}/{len(topic_ids)}] topic {tid}: {need} new ({len(existing)} existing), "
+        print(f"  [{k}/{len(topic_ids)}] topic {tid}: {n - len(existing)} new ({len(existing)} existing), "
               f"{len(study)} study + {len(practice)} practice chunks", flush=True)
-        qs, _ = complete_json(
-            messages(topic, study, practice, language, need, existing), model=model, purpose="questions.generate",
-            log=log, completion=completion, extra=extra,
-            validate=lambda obj, study=study, need=need, existing=existing: validate_questions(
-                obj, study, need, language, practice_all, existing))
-        log.check()
-        with conn:
-            for q in qs:
-                db.add_question(conn, tid, q, model)
-        added[tid] = len(qs)
-    return added
+        while len(existing) < n:
+            want = min(QUESTIONS_PER_CALL, n - len(existing))
+            try:
+                qs, _ = complete_json(
+                    messages(topic, study, practice, language, want, existing), model=model,
+                    purpose="questions.generate", log=log, completion=completion, extra=extra,
+                    validate=lambda obj, want=want, existing=list(existing): validate_questions(
+                        obj, study, want, language, practice_all, existing))
+            except QuotaExhausted:
+                raise
+            except LLMError as err:
+                log.check()  # too many invalid replies overall: stop the run
+                failed[tid] = str(err)
+                print(f"    failed, skipping this topic: {err}", flush=True)
+                break
+            log.check()
+            with conn:
+                for q in qs:
+                    db.add_question(conn, tid, q, model)
+            existing += [q["prompt"] for q in qs]
+            added[tid] = added.get(tid, 0) + len(qs)
+    return added, failed
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -239,11 +263,15 @@ def main(argv: list[str] | None = None) -> None:
     topics._confirm(e, args.yes)
     extra = {"reasoning_effort": args.reasoning_effort} if args.reasoning_effort else None
     try:
-        added = generate(conn, args.set, model, ids, n=args.n, extra=extra)
+        added, failed = generate(conn, args.set, model, ids, n=args.n, extra=extra)
     except LLMError as err:
-        raise SystemExit(f"Stopped: {err}\nTopics finished before the stop are saved; "
+        raise SystemExit(f"Stopped: {err}\nQuestions finished before the stop are saved; "
                          "run the same command again to continue.") from None
     print(f"Added {sum(added.values())} questions to {len(added)} topics.")
+    if failed:
+        print(f"Failed topics ({len(failed)}), skipped; run the same command again to retry only these:")
+        for tid, reason in failed.items():
+            print(f"  topic {tid}: {reason}")
 
 
 if __name__ == "__main__":

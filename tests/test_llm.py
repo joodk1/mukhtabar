@@ -143,3 +143,18 @@ def test_rejection_reasons_are_logged_even_when_a_later_attempt_succeeds():
     complete_json([], validate=needs_answer, model="fake", purpose="t", log=log.append,
                   completion=scripted("{}", '{"answer": 2}'))
     assert log[0]["ok"] and log[0]["rejections"] == ['missing "answer"']
+
+
+def test_a_reply_cut_off_before_it_finished_is_rejected_with_the_reason():
+    log = []
+    calls = []
+
+    def completion(messages, **kwargs):
+        calls.append(1)
+        r = reply('{"answer": 3}')
+        r.choices[0].finish_reason = "length" if len(calls) == 1 else "stop"
+        return r
+    result, usage = complete_json([], validate=needs_answer, model="fake", purpose="t", log=log.append,
+                                  completion=completion)
+    assert result == 3 and usage.attempts == 2   # valid JSON, but the first reply was incomplete
+    assert "finish_reason=length" in log[0]["rejections"][0]

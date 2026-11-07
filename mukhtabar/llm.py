@@ -19,6 +19,7 @@ T = TypeVar("T")
 
 FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$")
 RETRY_PROMPT = "Your reply was invalid: {error}\nReply again with the corrected JSON only."
+FINISHED = (None, "stop")   # finish reasons of a complete reply (None: not reported)
 
 # Waits (seconds) before retrying a call that hit a per-minute rate limit, or a
 # temporary server/connection error. Exhausted quota (e.g. a daily limit) and
@@ -170,7 +171,13 @@ def complete_json(
                 c = _cost(response)
                 usage.cost_usd = None if c is None else (usage.cost_usd or 0.0) + c
             last_reply = response.choices[0].message.content
+            finish = getattr(response.choices[0], "finish_reason", None)
             try:
+                if finish not in FINISHED:
+                    # e.g. "length" (output limit) or "content_filter" (a provider filter, such as
+                    # Gemini's recitation check); the reply is incomplete even if it parses.
+                    raise Invalid(f"reply was cut off before it finished (finish_reason={finish}); "
+                                  "reply again, keeping it shorter")
                 result = validate(parse_json(last_reply))
             except Invalid as e:
                 error = str(e)
