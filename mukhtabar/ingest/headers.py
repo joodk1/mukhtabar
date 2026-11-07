@@ -3,9 +3,9 @@
 Deliberately conservative. A line is removed only if it sits in the outer band
 of the page and is either a page number, or the same text at the same height on
 a large share of the document's pages while being the outermost line on that
-edge (so a badge under a heading at the top of a box isn't mistaken for one). Study boxes that happen to start at the
-top of a page ("★ يجب حفظه") and per-chapter running titles stay in; the latter
-are reported as kept so they can be reviewed.
+edge (so a badge under a heading at the top of a box isn't mistaken for one).
+Labels of study boxes that happen to start at the top of a page, and per-chapter
+running titles, stay in; the latter are reported as kept so they can be reviewed.
 """
 
 import re
@@ -16,11 +16,16 @@ from mukhtabar.ingest.extract import Page
 
 EDGE = 0.08            # outer share of the page height, top and bottom
 MIN_SHARE = 0.20       # share of pages a repeated line must appear on
+MIN_REPEATS = 3        # ...and never fewer pages than this, so short documents keep their text
 MAX_Y_SPREAD = 0.02    # repeated lines must sit at a consistent height
 MIN_REPORTED = 3       # repeats below the threshold are reported from this count
 SAME_Y = 2.0           # points; lines this close to the edge-most one count as edge-most
 
 DIGITS = re.compile(r"[0-9٠-٩۰-۹]+")
+# Front matter is numbered with lowercase roman numerals ("iv"), up to 89 here
+# (letters i, v, x, l), so words like "mix" (1009) aren't read as numbers.
+# Uppercase is left alone so a lone "C" or "D" at a page edge isn't mistaken either.
+ROMAN = re.compile(r"(?<![A-Za-z])(?=[ivxl])(?:xl|l?x{0,3})(?:ix|iv|v?i{0,3})(?![A-Za-z])")
 PAGE_NUMBER = re.compile(r"[#\s/|.\-–—]*#[#\s/|.\-–—]*")
 # MCQ options ("أ ...", "ب ...") repeat a lot in question banks; never touch them.
 OPTION = re.compile(r"[أابجده]\s")
@@ -40,7 +45,7 @@ class EdgeReport:
 
 
 def _key(text: str) -> str:
-    return DIGITS.sub("#", text).strip()
+    return ROMAN.sub("#", DIGITS.sub("#", text)).strip()
 
 
 def _side(line, height: float) -> str | None:
@@ -86,7 +91,8 @@ def remove_headers_footers(pages: list[Page]) -> tuple[list[Page], EdgeReport]:
             continue
         if PAGE_NUMBER.fullmatch(key):
             remove_keys.add((side, key))
-        elif distinct >= MIN_SHARE * n_pages and max(ys) - min(ys) <= MAX_Y_SPREAD:
+        elif (distinct >= max(MIN_REPEATS, MIN_SHARE * n_pages)
+              and max(ys) - min(ys) <= MAX_Y_SPREAD):
             remove_keys.add((side, key))
         elif distinct >= MIN_REPORTED:
             kept.append((side, key, distinct))

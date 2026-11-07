@@ -35,6 +35,7 @@ FLAG_COLUMNS = "possible-columns-not-split"
 MIN_GUTTER = 6
 WIDE_GAP = 25
 SIDE_MARGIN = 0.05  # share of the page width
+SPAN_GAP_RATIO = 2.0  # a gap this many times a line's usual word gap separates columns
 
 
 def _reverse_runs(items: list, in_run) -> list:
@@ -141,16 +142,28 @@ def _find_gutter(words: list[dict], width: float, n_lines: int) -> tuple[float, 
     return best
 
 
-def _spans(line: list[dict], mid: float) -> bool:
+def _word_gaps(line: list[dict]) -> list[float]:
+    xs = sorted(line, key=lambda w: w["x0"])
+    return [b["x0"] - a["x1"] for a, b in zip(xs, xs[1:])]
+
+
+def _spans(line: list[dict], mid: float, page_gap: float) -> bool:
     """Whether a line runs across the gutter (a full-width heading or sentence)
     rather than being two column lines that share a baseline. A word may cover
-    the gutter's middle, or the middle may fall in an ordinary gap between words;
-    two columns leave a wide gap there."""
+    the gutter's middle, or the middle may fall in an ordinary gap between words.
+    "Ordinary" is judged against the line's own gaps (justified lines stretch
+    them evenly), or the page's when the line has too few words; two columns
+    leave a gap there that is clearly wider than the rest."""
     if any(w["x0"] < mid < w["x1"] for w in line):
         return True
     left = [w["x1"] for w in line if w["x1"] <= mid]
     right = [w["x0"] for w in line if w["x0"] >= mid]
-    return bool(left and right) and min(right) - max(left) < WIDE_GAP
+    if not (left and right):
+        return False
+    cross = min(right) - max(left)
+    others = [g for g in _word_gaps(line) if abs(g - cross) > 1e-6]
+    typical = statistics.median(others) if len(others) >= 2 else page_gap
+    return cross < min(WIDE_GAP, SPAN_GAP_RATIO * max(typical, 1.0))
 
 
 def _looks_multicolumn(lines: list[list[dict]]) -> bool:
@@ -254,11 +267,12 @@ def _layout_flow(words: list[dict], width: float) -> tuple[list[tuple[str, float
 
     g0, g1 = gutter
     mid = (g0 + g1) / 2
+    page_gap = statistics.median([g for l in lines for g in _word_gaps(l)] or [WIDE_GAP])
     ordered: list[list[dict]] = []
     right: list[dict] = []
     left: list[dict] = []
     for line in lines:
-        if _spans(line, mid):
+        if _spans(line, mid, page_gap):
             # A full-width line (e.g. a heading) closes the columns above it.
             ordered += _cluster_lines(right) + _cluster_lines(left)
             right, left = [], []

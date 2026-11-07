@@ -20,6 +20,28 @@ def test_removes_page_numbers_and_repeated_footer():
     assert len(report.removed) == 20
 
 
+def test_removes_lowercase_roman_page_numbers():
+    numerals = ["i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x"]
+    pages = [page(body(n), (r, 785)) for n, r in enumerate(numerals, start=1)]
+    out, report = remove_headers_footers(pages)
+    assert [r.text for r in report.removed] == numerals
+    assert all(p.text == body(n)[0] for n, p in enumerate(out, start=1))
+
+
+def test_keeps_uppercase_letters_and_words_made_of_roman_letters():
+    # A lone uppercase letter or an English word like "mix" at the edge is content.
+    pages = [page(body(n), (t, 785)) for n, t in enumerate(["C", "mix", "D", "civil"], start=1)]
+    out, report = remove_headers_footers(pages)
+    assert report.removed == []
+
+
+def test_short_document_keeps_its_last_lines():
+    # In a 2-page document, a line seen once is 50% of pages; that alone isn't a footer.
+    pages = [page(body(1), ("الخلاصة الأولى", 785)), page(body(2), ("الخلاصة الثانية", 785))]
+    out, report = remove_headers_footers(pages)
+    assert report.removed == []
+
+
 def test_keeps_badge_under_a_heading_even_if_repeated():
     # "جديد" sits under a heading at the top of many pages: content, not a header.
     headings = ["الأسهم", "السندات", "المشتقات", "الصناديق", "العملات",
